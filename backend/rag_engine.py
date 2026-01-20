@@ -6,12 +6,19 @@ from transformers import pipeline
 class RAGChatbot:
     def __init__(self):
         print("Initializing RAG Engine...")
-        # Load embedding model (lightweight)
-        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+        self.encoder = None
+        self.generator = None
+        self.index = None
+        self.chunks = []
         
-        # Load local LLM for generation (using flan-t5-small for speed on CPU)
-        # In a real setup, we might use a larger model or external API
-        self.generator = pipeline("text2text-generation", model="google/flan-t5-small")
+    def load_models(self):
+        if self.encoder is None:
+            print("Loading RAG Encoder...")
+            self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+            
+        if self.generator is None:
+            print("Loading RAG Generator...")
+            self.generator = pipeline("text2text-generation", model="google/flan-t5-small")
         
         self.index = None
         self.chunks = []
@@ -20,6 +27,7 @@ class RAGChatbot:
         """
         Splits report into chunks and builds FAISS index.
         """
+        self.load_models()
         # 1. Chunking (Simple sliding window or paragraph based)
         # Simple approach: Split by double newlines or sentences if too long
         self.chunks = [c.strip() for c in text.split('\n\n') if c.strip()]
@@ -77,6 +85,7 @@ class RAGChatbot:
                 "sources": []
             }
 
+        self.load_models()
         # Prompt Engineering for Flan-T5
         prompt = (
             f"You are a helpful and empathetic medical assistant. "
@@ -109,6 +118,7 @@ class RAGChatbot:
         if not self.chunks:
             return "Please upload a report first."
             
+        self.load_models()
         # Use simple heuristic or LLM summary chunks
         context = " ".join(self.chunks[:5]) # Use first few chunks as summary context
         

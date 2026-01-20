@@ -4,70 +4,98 @@ import json
 from transformers import pipeline
 from deepdiff import DeepDiff
 
-# Load Models
-print("Loading Summarization Model...")
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-
-print("Loading Explainer Model...")
-try:
-    explainer = pipeline("text2text-generation", model="google/flan-t5-small")
-except Exception as e:
-    print(f"Warning: Could not load explainer model: {e}")
-    explainer = None
-
-print("Loading Scispacy Medical Model...")
-try:
-    # Use the installed small scientific model
-    nlp = spacy.load("en_core_sci_sm")
-except OSError:
-    print("Warning: en_core_sci_sm not found, falling back to en_core_web_sm. Please install the model.")
-    try:
-        nlp = spacy.load("en_core_web_sm")
-    except:
-        from spacy.cli import download
-        download("en_core_web_sm")
-        nlp = spacy.load("en_core_web_sm")
-
-
-from PIL import Image
-import io
-
-import torch
-from transformers import MllamaForConditionalGeneration, AutoProcessor
-
-# --- VISUAL MODELS ---
-print("Loading Visual AI Models...")
+# Global Model Variables (Lazy Loaded)
+summarizer = None
+explainer = None
+nlp = None
 llama_model = None
 llama_processor = None
 clip_classifier = None
 
-# A. Try Loading Llama 3.2 Vision (11B)
-# This requires HF_TOKEN and significant RAM (>20GB) or VRAM.
-try:
-    model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-    print(f"Attempting to load {model_id}...")
-    
-    # Use device_map="auto" to offload to standard RAM if GPU/MPS is full
-    # torch_dtype=torch.bfloat16 is standard for Llama 3 on recent hardware
-    llama_model = MllamaForConditionalGeneration.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
-    llama_processor = AutoProcessor.from_pretrained(model_id)
-    print("SUCCESS: Llama 3.2 Vision Loaded!")
-    
-except Exception as e:
-    print(f"Llama 3.2 Load Failed (Falling back to CLIP): {e}")
-    # Common reasons: No HF_TOKEN, OOM, or model access not granted.
+def get_summarizer():
+    global summarizer
+    if summarizer is None:
+        print("Loading Summarization Model...")
+        try:
+            summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+        except Exception as e:
+            print(f"Error loading summarizer: {e}")
+            return None
+    return summarizer
 
-# B. Load CLIP (Zero-Shot) - Always load as fallback or primary if Llama fails
-try:
-    clip_classifier = pipeline("zero-shot-image-classification", model="openai/clip-vit-base-patch32")
-    if not llama_model:
-        print("Using CLIP as Primary Vision Model.")
-except Exception as e:
-    print(f"Warning: Could not load CLIP model: {e}")
+def get_explainer():
+    global explainer
+    if explainer is None:
+        print("Loading Explainer Model...")
+        try:
+            explainer = pipeline("text2text-generation", model="google/flan-t5-small")
+        except Exception as e:
+            print(f"Warning: Could not load explainer model: {e}")
+            explainer = None
+    return explainer
+
+def get_nlp():
+    global nlp
+    if nlp is None:
+        print("Loading Scispacy Medical Model...")
+        try:
+            # Use the installed small scientific model
+            nlp = spacy.load("en_core_sci_sm")
+        except OSError:
+            print("Warning: en_core_sci_sm not found, falling back to en_core_web_sm. Please install the model.")
+            try:
+                nlp = spacy.load("en_core_web_sm")
+            except:
+                try:
+                    from spacy.cli import download
+                    download("en_core_web_sm")
+                    nlp = spacy.load("en_core_web_sm")
+                except Exception as e:
+                    print(f"Error loading SpaCy: {e}")
+    return nlp
+
+def get_vision_models():
+    """
+    Lazy loads vision models. returns (llama_model, llama_processor, clip_classifier)
+    """
+    global llama_model, llama_processor, clip_classifier
+    
+    if llama_model is None and clip_classifier is None:
+        print("Loading Visual AI Models...")
+
+        # A. Try Loading Llama 3.2 Vision (11B)
+        # This requires HF_TOKEN and significant RAM (>20GB) or VRAM.
+        # Disabled by default for Render Free Tier / Standard deployments to prevent timeouts
+        load_llama = False 
+        
+        if load_llama:
+            try:
+                model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+                print(f"Attempting to load {model_id}...")
+                
+                # Use device_map="auto" to offload to standard RAM if GPU/MPS is full
+                # torch_dtype=torch.bfloat16 is standard for Llama 3 on recent hardware
+                llama_model = MllamaForConditionalGeneration.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                )
+                llama_processor = AutoProcessor.from_pretrained(model_id)
+                print("SUCCESS: Llama 3.2 Vision Loaded!")
+                
+            except Exception as e:
+                print(f"Llama 3.2 Load Failed (Falling back to CLIP): {e}")
+                # Common reasons: No HF_TOKEN, OOM, or model access not granted.
+
+        # B. Load CLIP (Zero-Shot) - Always load as fallback or primary if Llama fails
+        try:
+            clip_classifier = pipeline("zero-shot-image-classification", model="openai/clip-vit-base-patch32")
+            if not llama_model:
+                print("Using CLIP as Primary Vision Model.")
+        except Exception as e:
+            print(f"Warning: Could not load CLIP model: {e}")
+            
+    return llama_model, llama_processor, clip_classifier
 
 
 def analyze_medical_image(image_bytes):
@@ -75,6 +103,8 @@ def analyze_medical_image(image_bytes):
     Analyzes an X-Ray/MRI image using Llama 3.2 (if avail) or CLIP.
     """
     # 1. Try Llama 3.2 Vision (Deep Analysis)
+    llama_model, llama_processor, clip_classifier = get_vision_models()
+    
     if llama_model and llama_processor:
         try:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -294,13 +324,14 @@ def explain_to_patient(text):
     if not text or not text.strip():
         return "No significant findings to explain."
         
-    if not explainer:
+    model = get_explainer()
+    if not model:
         return simplify_text(text)
         
     try:
         # Prompt Engineering for Flan-T5
         prompt = f"Explain this medical finding to a patient in simple words: {text}"
-        output = explainer(prompt, max_length=128, do_sample=False)
+        output = model(prompt, max_length=128, do_sample=False)
         return output[0]['generated_text']
     except Exception as e:
         print(f"Explainer Error: {e}")
@@ -423,7 +454,9 @@ def summarize_text(text):
     if len(text) > 2000:
         text = text[:2000]
     try:
-        summary = summarizer(text, max_length=150, min_length=40, do_sample=False)
+        model = get_summarizer()
+        if not model: return "Summary unavailable."
+        summary = model(text, max_length=150, min_length=40, do_sample=False)
         return summary[0]['summary_text']
     except:
         return "Summary unavailable."
@@ -579,8 +612,12 @@ def analyze_full_report(current_text, previous_text=None):
     summary = summarize_text(current_text)
     
     # Entities
-    doc = nlp(current_text)
-    entities = [{"text": e.text, "label": "ENTITY"} for e in doc.ents]
+    nlp_model = get_nlp()
+    if nlp_model:
+        doc = nlp_model(current_text)
+        entities = [{"text": e.text, "label": "ENTITY"} for e in doc.ents]
+    else:
+        entities = []
     entities = [dict(t) for t in {tuple(d.items()) for d in entities}]
 
 def detect_report_type(text):
@@ -617,22 +654,26 @@ def analyze_radiology(text, sections):
     impression = sections.get('impression', '')
     
     # NLP Extraction for Abnormalities
-    doc = nlp(findings + " " + impression)
-    
-    # Heuristic: Find sentences with 'alert' words
-    abnormalities = []
-    alert_terms = [
-        "mass", "nodule", "fracture", "herniation", "stenosis", 
-        "lesion", "cyst", "tumor", "infarct", "hemorrhage", 
-        "effusion", "opacification", "tear", "rupture", "dislocation"
-    ]
-    
-    for sent in doc.sents:
-        sent_text = sent.text.strip()
-        if any(term in sent_text.lower() for term in alert_terms):
-            # Check if it is negated? (Basic check)
-            if "no " not in sent_text.lower() and "unremarkable" not in sent_text.lower():
-                abnormalities.append(sent_text)
+    nlp_model = get_nlp()
+    if nlp_model:
+        doc = nlp_model(findings + " " + impression)
+        
+        # Heuristic: Find sentences with 'alert' words
+        abnormalities = []
+        alert_terms = [
+            "mass", "nodule", "fracture", "herniation", "stenosis", 
+            "lesion", "cyst", "tumor", "infarct", "hemorrhage", 
+            "effusion", "opacification", "tear", "rupture", "dislocation"
+        ]
+        
+        for sent in doc.sents:
+            sent_text = sent.text.strip()
+            if any(term in sent_text.lower() for term in alert_terms):
+                # Check if it is negated? (Basic check)
+                if "no " not in sent_text.lower() and "unremarkable" not in sent_text.lower():
+                    abnormalities.append(sent_text)
+    else:
+        abnormalities = []
                 
     # Deduplicate
     abnormalities = list(set(abnormalities))
@@ -693,8 +734,12 @@ def analyze_full_report(current_text, previous_text=None):
     summary = summarize_text(current_text)
     
     # 4. Entities (Common)
-    doc = nlp(current_text)
-    entities = [{"text": e.text, "label": "ENTITY"} for e in doc.ents]
+    nlp_model = get_nlp()
+    if nlp_model:
+        doc = nlp_model(current_text)
+        entities = [{"text": e.text, "label": "ENTITY"} for e in doc.ents]
+    else:
+        entities = []
     entities = [dict(t) for t in {tuple(d.items()) for d in entities}]
     
     result = {
