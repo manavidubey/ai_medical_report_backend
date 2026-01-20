@@ -1,0 +1,19 @@
+PATIENT: John Doe
+DOB: 01/01/1980
+ACCESSION: S23-12345
+DATE: 01/15/2023
+
+SPECIMEN:
+A. Skin, right forearm, shave biopsy.
+
+GROSS DESCRIPTION:
+Received in formalin is a shapeless portion of tan skin measuring 0.8 x 0.6 x 0.2 cm. The surface is tan-brown and slightly raised. Bisected and submitted in toto in cassette A1.
+
+MICROSCOPIC DESCRIPTION:
+Sections show a proliferation of basaloid cells extending from the epidermis into the underlying dermis. The tumor islands show peripheral palisading and focal retraction artifact. There is no invasion of the deep reticular dermis. Solar elastosis is present.
+
+DIAGNOSIS:
+Skin, right forearm, shave biopsy:
+- BASAL CELL CARCINOMA.
+- Margins appear involved by tumor.
+- Solar elastosis.

@@ -1,0 +1,20 @@
+fastapi
+uvicorn
+python-multipart
+transformers
+torch --index-url https://download.pytorch.org/whl/cpu
+sentencepiece
+spacy
+pdfplumber
+python-docx
+deepdiff
+scipy
+pandas
+gTTS
+fpdf
+sentence-transformers
+faiss-cpu
+Pillow
+accelerate
+protobuf
+

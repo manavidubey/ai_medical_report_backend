@@ -1,0 +1,17 @@
+PATIENT: John Doe
+DOB: 01/01/1980
+ACCESSION: S22-98765
+DATE: 06/10/2022
+
+SPECIMEN:
+A. Skin, right forearm, biopsy.
+
+GROSS DESCRIPTION:
+0.4 cm skin shaving.
+
+MICROSCOPIC DESCRIPTION:
+The epidermis shows hyperkeratosis and parakeratosis. There is atypical maturation of keratinocytes in the lower third of the epidermis. No invasive carcinoma is seen.
+
+DIAGNOSIS:
+Skin, right forearm:
+- ACTINIC KERATOSIS.
