@@ -174,29 +174,153 @@ def analyze_medical_image(image_bytes):
     return {"error": "No Vision Models Available."}
 
 REFERENCE_RANGES = {
-    # Lipids
+    # 1. COMPLETE BLOOD COUNT (CBC + DIFFERENTIAL)
+    "hemoglobin": {"min": 12.0, "max": 17.5, "unit": "g/dL"}, # Combined M/F
+    "rbc count": {"min": 4.1, "max": 5.9, "unit": "million/uL"},
+    "wbc count": {"min": 4000, "max": 11000, "unit": "/uL"},
+    "platelets": {"min": 150000, "max": 450000, "unit": "/uL"},
+    "hematocrit": {"min": 36, "max": 53, "unit": "%"},
+    "mcv": {"min": 80, "max": 100, "unit": "fL"},
+    "mch": {"min": 27, "max": 33, "unit": "pg"},
+    "mchc": {"min": 32, "max": 36, "unit": "g/dL"},
+    "rdw": {"min": 11.5, "max": 14.5, "unit": "%"},
+    "neutrophils": {"min": 40, "max": 70, "unit": "%"},
+    "lymphocytes": {"min": 20, "max": 40, "unit": "%"},
+    "monocytes": {"min": 2, "max": 8, "unit": "%"},
+    "eosinophils": {"min": 1, "max": 4, "unit": "%"},
+    "basophils": {"min": 0, "max": 1, "unit": "%"},
+
+    # 2. LIPID PROFILE (ADVANCED)
     "cholesterol": {"min": 0, "max": 200, "unit": "mg/dL"},
     "total cholesterol": {"min": 0, "max": 200, "unit": "mg/dL"},
-    "hdl": {"min": 40, "max": 100, "unit": "mg/dL"},
+    "ldl-c": {"min": 0, "max": 100, "unit": "mg/dL"},
     "ldl": {"min": 0, "max": 100, "unit": "mg/dL"},
+    "hdl-c": {"min": 40, "max": 100, "unit": "mg/dL"}, # Using Male lower bound as generic min
+    "hdl": {"min": 40, "max": 100, "unit": "mg/dL"},
     "triglycerides": {"min": 0, "max": 150, "unit": "mg/dL"},
-    
-    # Metabolic
-    "glucose": {"min": 70, "max": 100, "unit": "mg/dL"},
-    "fasting blood sugar": {"min": 70, "max": 100, "unit": "mg/dL"},
-    "creatinine": {"min": 0.6, "max": 1.2, "unit": "mg/dL"},
-    "bun": {"min": 7, "max": 20, "unit": "mg/dL"},
+    "vldl": {"min": 5, "max": 40, "unit": "mg/dL"},
+    "non-hdl cholesterol": {"min": 0, "max": 130, "unit": "mg/dL"},
+    "apob": {"min": 0, "max": 90, "unit": "mg/dL"},
+    "lp(a)": {"min": 0, "max": 30, "unit": "mg/dL"},
+    "cholesterol/hdl ratio": {"min": 0, "max": 4.5, "unit": "ratio"},
+
+    # 3. LIVER FUNCTION TEST (LFT)
     "ast": {"min": 10, "max": 40, "unit": "U/L"},
     "sgot": {"min": 10, "max": 40, "unit": "U/L"},
     "alt": {"min": 7, "max": 56, "unit": "U/L"},
     "sgpt": {"min": 7, "max": 56, "unit": "U/L"},
-    
-    # CBC
-    "hemoglobin": {"min": 13.5, "max": 17.5, "unit": "g/dL"},
-    "hb": {"min": 13.5, "max": 17.5, "unit": "g/dL"},
-    "wbc": {"min": 4.5, "max": 11.0, "unit": "x10^3/uL"},
-    "white blood count": {"min": 4.5, "max": 11.0, "unit": "x10^3/uL"},
-    "platelets": {"min": 150, "max": 450, "unit": "x10^3/uL"},
+    "alp": {"min": 44, "max": 147, "unit": "U/L"},
+    "ggt": {"min": 9, "max": 48, "unit": "U/L"},
+    "total bilirubin": {"min": 0.3, "max": 1.2, "unit": "mg/dL"},
+    "direct bilirubin": {"min": 0.0, "max": 0.3, "unit": "mg/dL"},
+    "indirect bilirubin": {"min": 0.2, "max": 0.9, "unit": "mg/dL"},
+    "albumin": {"min": 3.5, "max": 5.0, "unit": "g/dL"},
+    "globulin": {"min": 2.0, "max": 3.5, "unit": "g/dL"},
+    "total protein": {"min": 6.0, "max": 8.3, "unit": "g/dL"},
+    "a/g ratio": {"min": 1.1, "max": 2.5, "unit": "ratio"},
+
+    # 4. KIDNEY FUNCTION TEST (KFT)
+    "creatinine": {"min": 0.59, "max": 1.35, "unit": "mg/dL"}, # Combined range
+    "urea": {"min": 15, "max": 40, "unit": "mg/dL"},
+    "bun": {"min": 7, "max": 20, "unit": "mg/dL"},
+    "uric acid": {"min": 2.4, "max": 7.0, "unit": "mg/dL"},
+    "egfr": {"min": 90, "max": 200, "unit": "mL/min/1.73m²"}, # Min is critical
+
+    # 5. DIABETES & METABOLIC
+    "fasting glucose": {"min": 70, "max": 99, "unit": "mg/dL"},
+    "glucose": {"min": 70, "max": 99, "unit": "mg/dL"}, # Default to fasting range standard
+    "post-prandial glucose": {"min": 0, "max": 140, "unit": "mg/dL"},
+    "random glucose": {"min": 0, "max": 200, "unit": "mg/dL"},
+    "hba1c": {"min": 0, "max": 5.7, "unit": "%"},
+    "insulin": {"min": 2, "max": 25, "unit": "uIU/mL"},
+    "homa-ir": {"min": 0, "max": 2.0, "unit": "index"},
+
+    # 6. THYROID PANEL (FULL)
+    "tsh": {"min": 0.4, "max": 4.0, "unit": "mIU/L"},
+    "total t3": {"min": 80, "max": 200, "unit": "ng/dL"},
+    "total t4": {"min": 5.0, "max": 12.0, "unit": "ug/dL"},
+    "free t3": {"min": 2.3, "max": 4.2, "unit": "pg/mL"},
+    "free t4": {"min": 0.8, "max": 1.8, "unit": "ng/dL"},
+    "anti-tpo": {"min": 0, "max": 35, "unit": "IU/mL"},
+    "anti-tg": {"min": 0, "max": 20, "unit": "IU/mL"},
+
+    # 7. ELECTROLYTES & MINERALS
+    "sodium": {"min": 135, "max": 145, "unit": "mmol/L"},
+    "potassium": {"min": 3.5, "max": 5.1, "unit": "mmol/L"},
+    "chloride": {"min": 98, "max": 107, "unit": "mmol/L"},
+    "calcium": {"min": 8.6, "max": 10.2, "unit": "mg/dL"},
+    "ionized calcium": {"min": 1.12, "max": 1.32, "unit": "mmol/L"},
+    "phosphorus": {"min": 2.5, "max": 4.5, "unit": "mg/dL"},
+    "magnesium": {"min": 1.7, "max": 2.2, "unit": "mg/dL"},
+
+    # 8. IRON STUDIES
+    "serum iron": {"min": 60, "max": 170, "unit": "ug/dL"},
+    "ferritin": {"min": 11, "max": 336, "unit": "ng/mL"},
+    "tibc": {"min": 240, "max": 450, "unit": "ug/dL"},
+    "transferrin saturation": {"min": 20, "max": 50, "unit": "%"},
+
+    # 9. VITAMINS & NUTRITION
+    "vitamin d": {"min": 30, "max": 100, "unit": "ng/mL"},
+    "vitamin b12": {"min": 200, "max": 900, "unit": "pg/mL"},
+    "folate": {"min": 2.7, "max": 17, "unit": "ng/mL"},
+    "vitamin a": {"min": 20, "max": 60, "unit": "ug/dL"},
+    "vitamin e": {"min": 5, "max": 20, "unit": "ug/mL"},
+    "vitamin k": {"min": 0.2, "max": 3.2, "unit": "ng/mL"},
+
+    # 10. INFLAMMATION & INFECTION
+    "crp": {"min": 0, "max": 1.0, "unit": "mg/L"},
+    "hs-crp": {"min": 0, "max": 3.0, "unit": "mg/L"},
+    "esr": {"min": 0, "max": 20, "unit": "mm/hr"},
+    "procalcitonin": {"min": 0, "max": 0.1, "unit": "ng/mL"},
+    "il-6": {"min": 0, "max": 7, "unit": "pg/mL"},
+    "d-dimer": {"min": 0, "max": 500, "unit": "ng/mL"},
+
+    # 11. CARDIAC MARKERS
+    "troponin i": {"min": 0, "max": 0.04, "unit": "ng/mL"},
+    "troponin t": {"min": 0, "max": 0.01, "unit": "ng/mL"},
+    "ck-mb": {"min": 0, "max": 5, "unit": "ng/mL"},
+    "bnp": {"min": 0, "max": 100, "unit": "pg/mL"},
+    "nt-probnp": {"min": 0, "max": 125, "unit": "pg/mL"},
+
+    # 12. HORMONES
+    "cortisol": {"min": 5, "max": 25, "unit": "ug/dL"},
+    "acth": {"min": 10, "max": 60, "unit": "pg/mL"},
+    "prolactin": {"min": 4, "max": 25, "unit": "ng/mL"},
+    "lh": {"min": 2, "max": 15, "unit": "IU/L"},
+    "fsh": {"min": 3, "max": 10, "unit": "IU/L"},
+    "testosterone": {"min": 15, "max": 1000, "unit": "ng/dL"}, # Wide range M/F
+    "estradiol": {"min": 30, "max": 400, "unit": "pg/mL"},
+
+    # 13. AUTOIMMUNE
+    "rf": {"min": 0, "max": 14, "unit": "IU/mL"},
+    "anti-ccp": {"min": 0, "max": 20, "unit": "U/mL"},
+    "dsdna": {"min": 0, "max": 30, "unit": "IU/mL"},
+    "complement c3": {"min": 90, "max": 180, "unit": "mg/dL"},
+    "complement c4": {"min": 10, "max": 40, "unit": "mg/dL"},
+
+    # 14. TUMOR MARKERS
+    "afp": {"min": 0, "max": 10, "unit": "ng/mL"},
+    "cea": {"min": 0, "max": 3, "unit": "ng/mL"},
+    "ca-125": {"min": 0, "max": 35, "unit": "U/mL"},
+    "ca-19-9": {"min": 0, "max": 37, "unit": "U/mL"},
+    "psa": {"min": 0, "max": 4.0, "unit": "ng/mL"},
+
+    # 15. COAGULATION
+    "pt": {"min": 11, "max": 13.5, "unit": "sec"},
+    "inr": {"min": 0.8, "max": 1.2, "unit": "ratio"},
+    "aptt": {"min": 25, "max": 35, "unit": "sec"},
+    "fibrinogen": {"min": 200, "max": 400, "unit": "mg/dL"},
+
+    # 16. URINE
+    "ph": {"min": 4.5, "max": 8.0, "unit": "pH"},
+    "specific gravity": {"min": 1.005, "max": 1.030, "unit": "sg"},
+
+    # 18. ABG
+    "ph blood": {"min": 7.35, "max": 7.45, "unit": "pH"},
+    "pao2": {"min": 75, "max": 100, "unit": "mmHg"},
+    "paco2": {"min": 35, "max": 45, "unit": "mmHg"},
+    "hco3": {"min": 22, "max": 26, "unit": "mEq/L"},
+    "o2 saturation": {"min": 95, "max": 100, "unit": "%"}
 }
 
 # Simple Medical Dictionary for Patient Translation
