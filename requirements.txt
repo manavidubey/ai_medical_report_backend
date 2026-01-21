@@ -20,3 +20,7 @@ faiss-cpu
 Pillow
 accelerate
 protobuf
+paddlepaddle
+paddleocr
+pymupdf
+opencv-python-headless

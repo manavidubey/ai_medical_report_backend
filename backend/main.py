@@ -31,15 +31,22 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 
 # Initialize RAG System
 rag_system = RAGChatbot()
+from pdf_processor import process_pdf
+
 def extract_text_from_file(filepath):
+    """
+    Extracts text using the robust PDF pipeline (Text/OCR).
+    """
     ext = os.path.splitext(filepath)[1].lower()
     text = ""
     
     try:
         if ext == '.pdf':
-            with pdfplumber.open(filepath) as pdf:
-                for page in pdf.pages:
-                    text += page.extract_text() + "\n"
+            with open(filepath, "rb") as f:
+                file_bytes = f.read()
+            # Use the new robust processor
+            text = process_pdf(file_bytes)
+            
         elif ext == '.docx':
             doc = docx.Document(filepath)
             text = "\n".join([p.text for p in doc.paragraphs])
