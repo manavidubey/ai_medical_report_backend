@@ -875,6 +875,7 @@ def chunk_text(text, chunk_size=3000, overlap=200):
 def summarize_text(text):
     """
     Recursively summarizes long text (Map-Reduce style).
+    Optimized for Speed: Batched Inference + Density Sampling.
     """
     model = get_summarizer()
     if not model: return "Summary unavailable."
@@ -882,8 +883,6 @@ def summarize_text(text):
     # 1. If short enough, summarize directly
     if len(text) < 3000:
         try:
-            # max_length usually 1024 for BART, but we limit output here
-            # Input truncation is handled by the model pipeline usually, but we want to be safe
             summary = model(text[:3000], max_length=150, min_length=40, do_sample=False, truncation=True)
             return summary[0]['summary_text']
         except Exception as e:
@@ -892,16 +891,54 @@ def summarize_text(text):
 
     # 2. Long Document Strategy
     print(f"Long text detected ({len(text)} chars). Chunking...")
-    chunks = chunk_text(text)
+    
+    # FAST MODE: If huge (> 50k chars), sample intelligently
+    if len(text) > 50000:
+        print("Enable FAST MODE: Density Sampling active.")
+        # We take first 15k (History/Context), last 10k (Impression), and sample middle
+        # This drastically reduces context for 100+ page reports while keeping key areas.
+        head = text[:15000]
+        tail = text[-10000:]
+        middle = text[15000:-10000]
+        
+        # Sample middle: take 5 chunks of 2000 chars evenly spaced
+        mid_chunks = []
+        if len(middle) > 10000:
+            step = len(middle) // 5
+            for i in range(0, len(middle), step):
+                mid_chunks.append(middle[i:i+2000])
+        else:
+            mid_chunks = [middle]
+            
+        text_to_process = head + "\n...\n" + "\n...\n".join(mid_chunks) + "\n...\n" + tail
+        chunks = chunk_text(text_to_process)
+    else:
+        chunks = chunk_text(text)
+
     chunk_summaries = []
     
-    for i, chunk in enumerate(chunks):
+    # BATCH processing (Speedup)
+    # Pipeline handles batching if we pass a List.
+    # Batch size 4 is safe for MPS/CPU usually.
+    BATCH_SIZE = 4 
+    
+    # Process in batches
+    for i in range(0, len(chunks), BATCH_SIZE):
+        batch = chunks[i : i + BATCH_SIZE]
         try:
-            res = model(chunk, max_length=100, min_length=30, do_sample=False, truncation=True)
-            chunk_summaries.append(res[0]['summary_text'])
+            # model(List[str]) returns List[dict]
+            results = model(batch, max_length=100, min_length=30, do_sample=False, truncation=True)
+            for res in results:
+                chunk_summaries.append(res['summary_text'])
         except Exception as e:
-            print(f"Error summarizing chunk {i}: {e}")
-            
+             print(f"Error summarizing batch {i}: {e}")
+             # Fallback: try one by one if batch fails
+             for chunk in batch:
+                 try:
+                     res = model(chunk, max_length=100, min_length=30, do_sample=False, truncation=True)
+                     chunk_summaries.append(res[0]['summary_text'])
+                 except: continue
+
     # 3. Final Summary of Summaries
     combined_summary_text = " ".join(chunk_summaries)
     try:
