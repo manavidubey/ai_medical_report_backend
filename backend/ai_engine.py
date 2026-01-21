@@ -364,12 +364,42 @@ SYNONYMS = {
     "platelet count": "platelets",
     "a1c": "hba1c",
     "hba1c": "hba1c",
-    "glycated hemoglobin": "hba1c"
+    "glycated hemoglobin": "hba1c",
+    "tlc": "wbc count",
+    "total leukocyte count": "wbc count",
+    "dlc": "differential", # Generic mapping
+    "neutrophils": "neutrophils", # Ensure self-mapping exists
+    "polymorphs": "neutrophils",
+    "lymphocytes": "lymphocytes",
+    "monocytes": "monocytes",
+    "eosinophils": "eosinophils",
+    "basophils": "basophils",
+    "r.b.c": "rbc count",
+    "w.b.c": "wbc count",
+    "tec": "eosinophils",
+    "absolute eosinophil count": "eosinophils" # Approximation
 }
 
 def normalize_name(name):
     clean = name.lower().strip().replace(":", "").replace(".", "")
     return SYNONYMS.get(clean, clean)
+
+def extract_sections(text):
+    # (Unchanged extraction logic)
+    # ... (Keep existing extract_sections code, assuming it's robust enough for now)
+    # Re-pasting extract_sections header to match replace block signature if needed
+    # But since we are editing a block, let's keep it focused or use multi-replace if widely separated.
+    # The user asked for "Universal robustness", focusing on Synonyms + Regex.
+    # We are replacing chunk starting from SYNONYMS down to extract_labs_regex start.
+    pass 
+    # WAIT, I cannot replace just a function start without providing the full function body if the TargetContent spans across.
+    # Let's adjust the range strictly to SYNONYMS first, then Regex separately.
+    pass
+
+# Correcting strategy: Split into two edits. 
+# 1. Update SYNONYMS
+# 2. Update extract_labs_regex logic
+
 
 def extract_sections(text):
     """
@@ -479,14 +509,15 @@ def extract_labs_regex(text):
     """
     Improved regex to catch labs, units, and ranges.
     Prioritizes Lab Report Range > System Default.
+    Supports Unit Inference if unit is missing.
     """
     labs = []
     
-    # Pattern: Name: Value Unit [Range?]
-    # Groups: 1=Name, 2=Value, 3=Unit, 4=Range(Optional)
-    # Range patterns matched: (10-20), 10.0 - 20.0, > 50, < 100
+    # Pattern: Name: Value Unit? [Range?]
+    # Groups: 1=Name, 2=Value, 3=Unit(Optional), 4=Range(Optional)
+    # Changed group 3 to optional (with ?) and added check logic
     pattern = re.compile(
-        r"([A-Za-z0-9\s\(\)\-\.]+?)[:\s]+(\d+(?:\.\d+)?)\s*([a-zA-Z%\^/0-9]+)\s*(?:[\(\[]?(\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?|[<>]\s*\d+(?:\.\d+)?)[\)\]]?)?"
+        r"([A-Za-z0-9\s\(\)\-\.]+?)[:\s]+(\d+(?:\.\d+)?)\s*([a-zA-Z%\^/0-9]*)\s*(?:[\(\[]?(\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?|[<>]\s*\d+(?:\.\d+)?)[\)\]]?)?"
     )
     
     found_names = set()
@@ -503,10 +534,16 @@ def extract_labs_regex(text):
         normalized = normalize_name(raw_name)
         system_ref = REFERENCE_RANGES.get(normalized)
         
-        # Validation: If not in our KB, check if unit looks "lab-like"
-        known_units = ["mg/dl", "g/dl", "u/l", "mmol/l", "%", "x10^3/ul", "fl", "pg", "iu/l", "ng/ml", "ug/dl", "ratio"]
+        # Unit Inference Logic
+        if not unit and system_ref:
+            # If unit missing but we know the test, infer it
+            unit = system_ref.get('unit', '')
+            
+        # Validation: If unit still invalid/missing and not in KB, skip
+        known_units = ["mg/dl", "g/dl", "u/l", "mmol/l", "%", "x10^3/ul", "fl", "pg", "iu/l", "ng/ml", "ug/dl", "ratio", "/ul", "cells/ul"]
         if not system_ref and unit.lower() not in known_units:
-            continue
+             # Last ditch: check if value is plausible for a known test (too risky? probably.)
+             continue
 
         if normalized in found_names: continue
 
