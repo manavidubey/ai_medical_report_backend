@@ -315,6 +315,10 @@ REFERENCE_RANGES = {
     "ph": {"min": 4.5, "max": 8.0, "unit": "pH"},
     "specific gravity": {"min": 1.005, "max": 1.030, "unit": "sg"},
 
+    # 17. PANCREATIC
+    "amylase": {"min": 30, "max": 110, "unit": "U/L"},
+    "lipase": {"min": 0, "max": 160, "unit": "U/L"},
+
     # 18. ABG
     "ph blood": {"min": 7.35, "max": 7.45, "unit": "pH"},
     "pao2": {"min": 75, "max": 100, "unit": "mmHg"},
