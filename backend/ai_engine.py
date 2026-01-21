@@ -617,16 +617,59 @@ def generate_recommendations(labs, risks):
 
     return recs
 
+def chunk_text(text, chunk_size=3000, overlap=200):
+    """
+    Splits text into chunks with overlap for processing long documents.
+    """
+    chunks = []
+    start = 0
+    text_len = len(text)
+    
+    while start < text_len:
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += (chunk_size - overlap)
+        
+    return chunks
+
 def summarize_text(text):
-    if len(text) > 2000:
-        text = text[:2000]
+    """
+    Recursively summarizes long text (Map-Reduce style).
+    """
+    model = get_summarizer()
+    if not model: return "Summary unavailable."
+    
+    # 1. If short enough, summarize directly
+    if len(text) < 3000:
+        try:
+            # max_length usually 1024 for BART, but we limit output here
+            # Input truncation is handled by the model pipeline usually, but we want to be safe
+            summary = model(text[:3000], max_length=150, min_length=40, do_sample=False, truncation=True)
+            return summary[0]['summary_text']
+        except Exception as e:
+            print(f"Summary Error (Short): {e}")
+            return "Summary generation failed."
+
+    # 2. Long Document Strategy
+    print(f"Long text detected ({len(text)} chars). Chunking...")
+    chunks = chunk_text(text)
+    chunk_summaries = []
+    
+    for i, chunk in enumerate(chunks):
+        try:
+            res = model(chunk, max_length=100, min_length=30, do_sample=False, truncation=True)
+            chunk_summaries.append(res[0]['summary_text'])
+        except Exception as e:
+            print(f"Error summarizing chunk {i}: {e}")
+            
+    # 3. Final Summary of Summaries
+    combined_summary_text = " ".join(chunk_summaries)
     try:
-        model = get_summarizer()
-        if not model: return "Summary unavailable."
-        summary = model(text, max_length=150, min_length=40, do_sample=False)
-        return summary[0]['summary_text']
-    except:
-        return "Summary unavailable."
+         final_summary = model(combined_summary_text[:3000], max_length=200, min_length=50, do_sample=False, truncation=True)
+         return final_summary[0]['summary_text']
+    except Exception as e:
+        print(f"Summary Error (Final): {e}")
+        return combined_summary_text[:500] + "..."
 
 def get_follow_up_tests(labs, risks):
     tests = []
