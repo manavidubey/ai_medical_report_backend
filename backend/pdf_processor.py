@@ -62,29 +62,117 @@ def preprocess_image_for_ocr(image):
     
     return binary
 
+from difflib import SequenceMatcher
+
+class DocumentStitcher:
+    """
+    Intelligently stitches PDF pages by removing repeating headers/footers
+    and maintaining document continuity.
+    """
+    def __init__(self, min_similarity=0.85):
+        self.min_similarity = min_similarity
+
+    def _get_clean_lines(self, text):
+        return [line.strip() for line in text.split('\n') if len(line.strip()) > 5]
+
+    def identify_repeating_mask(self, pages_text, num_lines_to_check=5, reverse=False):
+        """
+        Identifies lines that repeat across pages (conceptually).
+        Returns a set of 'signature' strings that are headers/footers.
+        """
+        if len(pages_text) < 2: return set()
+        
+        signatures = set()
+        
+        # Compare Page i with Page i+1
+        for i in range(len(pages_text) - 1):
+            p1_lines = self._get_clean_lines(pages_text[i])
+            p2_lines = self._get_clean_lines(pages_text[i+1])
+            
+            if reverse:
+                p1_lines = p1_lines[::-1]
+                p2_lines = p2_lines[::-1]
+                
+            check_len = min(len(p1_lines), len(p2_lines), num_lines_to_check)
+            
+            for k in range(check_len):
+                line1 = p1_lines[k]
+                line2 = p2_lines[k]
+                
+                ratio = SequenceMatcher(None, line1, line2).ratio()
+                if ratio > self.min_similarity:
+                    # Add one of them to signatures
+                    signatures.add(line2) # Use the later one as stricter reference
+                    
+        return signatures
+
+    def stitch(self, pages_text):
+        if not pages_text: return ""
+        if len(pages_text) == 1: return pages_text[0]
+        
+        # 1. Detect Headers (Top of pages)
+        header_sigs = self.identify_repeating_mask(pages_text, num_lines_to_check=6, reverse=False)
+        
+        # 2. Detect Footers (Bottom of pages)
+        footer_sigs = self.identify_repeating_mask(pages_text, num_lines_to_check=4, reverse=True)
+        
+        stitched_doc = []
+        
+        for i, page in enumerate(pages_text):
+            lines = page.split('\n')
+            cleaned_page_lines = []
+            
+            for line in lines:
+                clean_line = line.strip()
+                if len(clean_line) < 3:
+                    cleaned_page_lines.append(line)
+                    continue
+                    
+                is_header = any(SequenceMatcher(None, clean_line, h).ratio() > self.min_similarity for h in header_sigs)
+                is_footer = any(SequenceMatcher(None, clean_line, f).ratio() > self.min_similarity for f in footer_sigs)
+                
+                # Rule: Keep Header on Page 1 (Context), Remove on others
+                if is_header:
+                    if i == 0:
+                        cleaned_page_lines.append(line)
+                    continue # Skip this line on subseq pages (or P1 if we want strictly no repeats, but P1 is usually reliable)
+                    
+                # Rule: Remove Footers everywhere (usually page nums etc)
+                if is_footer:
+                    continue
+                    
+                cleaned_page_lines.append(line)
+                
+            stitched_doc.append("\n".join(cleaned_page_lines))
+            
+        return "\n".join(stitched_doc)
+
 def extract_text_with_layout(file_bytes):
     """
     Extracts text using pdfplumber's layout preservation.
     Best for digital medical reports with tables.
     """
-    text_content = ""
+    pages_text = []
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
                 # layout=True helps preserve column structure visually
                 text = page.extract_text(layout=True)
                 if text:
-                    text_content += text + "\n"
+                    pages_text.append(text)
     except Exception as e:
         print(f"Layout Extraction Error: {e}")
-    return text_content
+        
+    # Stitch pages
+    stitcher = DocumentStitcher()
+    return stitcher.stitch(pages_text)
 
 def extract_text_with_ocr(file_bytes):
     """
     Converts PDF pages to images and runs PaddleOCR.
     Best for scanned reports or images wrapped in PDF.
     """
-    text_content = ""
+    pages_text = []
     ocr = get_ocr_model()
     
     try:
@@ -102,36 +190,30 @@ def extract_text_with_ocr(file_bytes):
             if pix.n == 4: # RGBA
                 img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2RGB)
             
-            # Preprocess
-            # processed_img = preprocess_image_for_ocr(img_data)
-            # PaddleOCR handles raw inputs quite well, but grayscale can help speed
-            
             # Run OCR
-            # result structure: [[[[x1,y1],[x2,y2],[x3,y3],[x4,y4]], (text, confidence)]]
-            result = ocr.ocr(img_data, cls=True)
-            
-            if not result or result[0] is None:
-                continue
+            if ocr:
+                result = ocr.ocr(img_data, cls=True)
+                if not result or result[0] is None:
+                    pages_text.append("")
+                    continue
+                    
+                # Sort boxes by Y-coordinate primarily (rows), then X-coordinate (columns)
+                # This is critical for medical tables
+                # PaddleOCR result: [ [ [[x1,y1]..], (text, conf) ], ... ]
+                lines_data = sorted(result[0], key=lambda x: x[0][0][1]) # Check Y1 of box
                 
-            # Reconstruct lines
-            # Sort boxes by Y-coordinate primarily (rows), then X-coordinate (columns)
-            # This is critical for medical tables
-            
-            boxes = [line[0] for line in result[0]]
-            txts = [line[1][0] for line in result[0]]
-            scores = [line[1][1] for line in result[0]]
-            
-            # Simple line reconstruction
-            # We add texts sequentially. For strictly table reconstruction, we need more logic.
-            # For now, we rely on the line-by-line nature of OCR output.
-            page_text = "\n".join(txts)
-            
-            text_content += page_text + "\n"
+                txts = [line[1][0] for line in lines_data]
+                page_text = "\n".join(txts)
+                pages_text.append(page_text)
+            else:
+                 pages_text.append("[OCR Failed - No Model]")
             
     except Exception as e:
         print(f"OCR Extraction Error: {e}")
-        
-    return text_content
+    
+    # Stitch pages
+    stitcher = DocumentStitcher()
+    return stitcher.stitch(pages_text)
 
 def process_pdf(file_bytes):
     """

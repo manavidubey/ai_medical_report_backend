@@ -25,3 +25,46 @@ else:
         print("SUCCESS: PDF Pipeline verification passed!")
     else:
         print("FAILURE: Extracted text is too short.")
+
+def test_stitcher():
+    print("\nTesting Document Stitcher Logic...")
+    from pdf_processor import DocumentStitcher
+    
+    # Simulate 2 pages with repeated header/footer and content spill
+    page1 = """
+    APOLLO HOSPITALS
+    Patient: John Doe
+    Page 1 of 2
+    
+    COMPLETE BLOOD COUNT
+    Hemoglobin: 14.5
+    WBC: 6000
+    """
+    
+    page2 = """
+    APOLLO HOSPITALS
+    Patient: John Doe
+    Page 2 of 2
+    
+    Platelets: 250000
+    """
+    
+    stitcher = DocumentStitcher()
+    stitched = stitcher.stitch([page1.strip(), page2.strip()])
+    
+    print("--- Stitched Output ---")
+    print(stitched)
+    print("-----------------------")
+    
+    # Verification: "APOLLO HOSPITALS" should appear once (at top), not twice.
+    if stitched.count("APOLLO HOSPITALS") == 1:
+        print("SUCCESS: Header removed from Page 2.")
+    else:
+        print(f"FAILURE: Header count is {stitched.count('APOLLO HOSPITALS')}")
+
+if __name__ == "__main__":
+    test_stitcher()
+    # Existing PDF test (commented out if file missing, or kept if present)
+    if os.path.exists(TEST_PDF):
+        with open(TEST_PDF, "rb") as f:
+             process_pdf(f.read()) # Just smoke test integration
