@@ -405,75 +405,274 @@ def extract_sections(text):
 # 2. Update extract_labs_regex logic
 
 
-def extract_sections(text):
+class ClinicalParser:
     """
-    Intelligent splitting of the report into key sections.
+    Robust regex-based parser to identify clinical sections.
+    Preserves order and handles variations in headers.
     """
-    sections = {
-        "history": "",
-        "findings": "",
-        "impression": ""
+    def __init__(self):
+        # Maps standard keys to list of potential regex variations
+        self.section_patterns = {
+            "labs": [r"laboratory data", r"investigation", r"haematology", r"biochemistry", r"lab results", r"test name"],
+            "history": [r"clinical history", r"history", r"clinical indication", r"reason for exam"],
+            "findings": [r"findings", r"technique", r"examination", r"procedure", r"comments", r"report"],
+            "impression": [r"impression", r"conclusion", r"diagnosis", r"summary", r"opinion"],
+            "advice": [r"advice", r"suggested correlation", r"recommendation"]
+        }
+
+    def parse(self, text):
+        found_sections = {}
+        # We search for all headers and their positions
+        headers_found = []
+        
+        text_lower = text.lower()
+        
+        for key, patterns in self.section_patterns.items():
+            for pat in patterns:
+                # Look for Header followed by colon or newline
+                # Use word boundary to avoid partial matches
+                matches = list(re.finditer(rf"\b{pat}\b[:\s]", text_lower))
+                for m in matches:
+                    headers_found.append({
+                        "key": key,
+                        "start": m.start(),
+                        "name": m.group().strip().strip(':'), # Capture actual text used
+                        "raw_start": m.start()
+                    })
+        
+        # Sort by position in document
+        headers_found.sort(key=lambda x: x['start'])
+        
+        # Filter overlapping/duplicates (keep first occurrence of a type if close?)
+        # For simple robustness, we just take distinct distinct sorted regions
+        
+        if not headers_found:
+             return {"full_text": text} # No structure detected, treat as one block
+            
+        for i, header in enumerate(headers_found):
+            start = header['start'] + len(header['name']) + 1 # +1 for colon assumption/space
+            
+            end = len(text)
+            if i + 1 < len(headers_found):
+                end = headers_found[i+1]['start']
+            
+            content = text[start:end].strip()
+            # If multiple headers of same key (e.g. History... Findings... History...), append or overwrite?
+            # Append is safer for merged docs.
+            if header['key'] in found_sections:
+                found_sections[header['key']] += "\n" + content
+            else:
+                found_sections[header['key']] = content
+                
+        # Debug Log
+        print(f"Detected {len(found_sections)} sections: {list(found_sections.keys())}")
+        return found_sections
+
+def process_clinical_document(text):
+    """
+    Orchestrator: Differentiated Processing Strategy.
+    """
+    print("\n--- Processing Clinical Document ---")
+    parser = ClinicalParser()
+    sections = parser.parse(text)
+    
+    # Data Containers
+    processed_data = {
+        "raw_sections": sections, # Added for Frontend Display
+        "structured_labs": [],
+        "lab_abnormalities": [],
+        "section_summaries": {},
+        "clinical_risks": [],
+        "recommendations": []
     }
     
-    # Normalize keys/headers
-    text_lower = text.lower()
+    # 1. Process Lab Data specifically
+    lab_text_source = sections.get('labs', "")
+    if not lab_text_source and "full_text" in sections:
+        lab_text_source = sections["full_text"] # Fallback
     
-    # Heuristic indices
-    idx_history = text_lower.find("history:") 
-    if idx_history == -1: idx_history = text_lower.find("clinical history:")
+    all_labs = extract_labs_regex(text) 
+    processed_data["structured_labs"] = all_labs
+    processed_data["lab_abnormalities"] = [l for l in all_labs if l['status'] != "Normal"]
     
-    idx_findings = text_lower.find("findings:") 
-    if idx_findings == -1: idx_findings = text_lower.find("technique:") # fallback
-    
-    idx_impression = text_lower.find("impression:")
-    if idx_impression == -1: idx_impression = text_lower.find("conclusion:")
-    if idx_impression == -1: idx_impression = text_lower.find("diagnosis:")
-
-    # Sort indices to know order
-    indices = sorted([
-        (idx_history, "history"), 
-        (idx_findings, "findings"), 
-        (idx_impression, "impression")
-    ], key=lambda x: x[0])
-    
-    # Extract
-    for i, (idx, key) in enumerate(indices):
-        if idx == -1: continue
+    # 2. Process Narrative Sections (History, Findings, Impression)
+    for sec_key in ["history", "findings", "impression"]:
+        content = sections.get(sec_key, "")
+        if not content: continue
         
-        start = idx + len(key) + 1 # +1 for colon
-        end = len(text)
+        word_count = len(content.split())
+        print(f"Processing Section '{sec_key}' ({word_count} words)...")
         
-        # Find start of next section used as end of current
-        if i + 1 < len(indices):
-            next_idx = indices[i+1][0]
-            if next_idx != -1:
-                end = next_idx
-        
-        content = text[start:end].strip()
-        sections[key] = content
-
-    # Fallback: if no structure found, put everything in findings
-    if not any(sections.values()):
-        sections["findings"] = text
-        
-    return sections
-
-def simplify_text(text):
-    """
-    Translates medical terms to plain English using Dictionary (Fallback).
-    """
-    words = text.split()
-    simplified = []
-    
-    for word in words:
-        clean_word = word.lower().strip(".,()[]")
-        if clean_word in MEDICAL_DICTIONARY:
-            # Append term + explanation
-            simplified.append(f"{word} ({MEDICAL_DICTIONARY[clean_word]})")
+        if word_count < 50:
+            processed_data["section_summaries"][sec_key] = content
+        elif word_count > 800:
+            processed_data["section_summaries"][sec_key] = summarize_text(content) 
         else:
-            simplified.append(word)
+            model = get_summarizer()
+            if model:
+                try:
+                    res = model(content, max_length=150, min_length=40, do_sample=False, truncation=True)
+                    processed_data["section_summaries"][sec_key] = res[0]['summary_text']
+                except:
+                     processed_data["section_summaries"][sec_key] = content[:500] + "..."
+            else:
+                 processed_data["section_summaries"][sec_key] = content[:500] + "..."
+
+    # 3. Calculate Risks
+    processed_data["clinical_risks"] = calculate_risk(all_labs)
+    processed_data["recommendations"] = generate_recommendations(all_labs, processed_data["clinical_risks"])
+    
+    return processed_data
+
+def synthesize_report(processed_data):
+    """
+    Hierarchical Synthesis of the final report.
+    """
+    report_lines = []
+    
+    # 1. Header & Context
+    report_lines.append("# Clinical Intelligence Report")
+    
+    # 2. Critical Findings (The "Red" Items)
+    risks = processed_data.get("clinical_risks", [])
+    abnormal_labs = processed_data.get("lab_abnormalities", [])
+    
+    if risks or abnormal_labs:
+        report_lines.append("\n## 🚨 Critical Findings & Risks")
+        for risk in risks:
+            report_lines.append(f"- **{risk['type']}**: {risk['status']} ({risk['detail']})")
+        for lab in abnormal_labs:
+            report_lines.append(f"- **{lab['name']}**: {lab['value']} {lab['unit']} ({lab['status']}) [Ref: {lab['reference']}]")
             
-    return " ".join(simplified)
+    # 3. Clinical Narrative (Synthesized from sections)
+    summaries = processed_data.get("section_summaries", {})
+    if summaries:
+        report_lines.append("\n## 📋 Clinical Interpretation")
+        
+        if "impression" in summaries:
+            report_lines.append(f"**Impression/Diagnosis:**\n{summaries['impression']}")
+            
+        if "history" in summaries:
+            report_lines.append(f"\n**Context:**\n{summaries['history']}")
+            
+        if "findings" in summaries:
+            report_lines.append(f"\n**Detailed Findings:**\n{summaries['findings']}")
+            
+    # 4. Action Plan / Recommendations
+    recs = processed_data.get("recommendations", [])
+    if recs:
+         report_lines.append("\n## ✅ Recommended Action Plan")
+         for rec in recs:
+             report_lines.append(f"- {rec}")
+    
+    return "\n".join(report_lines)
+
+def analyze_full_report(current_text, previous_text=None):
+    # 1. Run New Orchestrator
+    processed_data = process_clinical_document(current_text)
+    
+    # 2. Detect Type (Legacy Logic kept for Specialist routing)
+    report_type = detect_report_type(current_text)
+    
+    # 3. Generate Synthesis (Replaces blind summary)
+    full_narrative_report = synthesize_report(processed_data)
+    
+    # 4. Entities (Common)
+    nlp_model = get_nlp()
+    if nlp_model:
+        doc = nlp_model(current_text)
+        entities = [{"text": e.text, "label": "ENTITY"} for e in doc.ents]
+    else:
+        entities = []
+    entities = [dict(t) for t in {tuple(d.items()) for d in entities}]
+    
+    # 5. Construct Result (Frontend Compatible)
+    labs = processed_data["structured_labs"]
+    risks = processed_data["clinical_risks"]
+    recommendations = processed_data["recommendations"]
+    follow_up_tests = get_follow_up_tests(labs, risks)
+    raw_sections = processed_data["raw_sections"]
+    section_abstractions = processed_data["section_summaries"] 
+    # Frontend likely expects 'sections' key to be raw text for display tabs
+    
+    result = {
+        "report_type": report_type,
+        "summary": full_narrative_report,
+        "sections": raw_sections, 
+        "entities": entities
+    }
+
+    if report_type == "Radiology":
+        rad_analysis = analyze_radiology(current_text, raw_sections) # Pass raw sections
+        
+        # Patient Explanation for Radiology
+        patient_impression = explain_to_patient(raw_sections.get('impression', ''))
+        
+        # Specialists
+        specialists = ["Primary Care Physician"]
+        for ab in rad_analysis.get('abnormalities', []):
+            if "fracture" in ab.lower() or "bone" in ab.lower():
+                 specialists.append("Orthopedist")
+            if "tumor" in ab.lower() or "mass" in ab.lower():
+                 specialists.append("Oncologist")
+        specialists = list(set(specialists))
+
+        result.update({
+            "radiology": rad_analysis,
+            "patient_view": {
+                "findings": "See imaging details below.",
+                "impression": patient_impression,
+                "explanation": "Imaging reports describe visual findings. We've highlighted key abnormalities."
+            },
+            "risks": [], 
+            "labs": [], 
+            "recommendations": [],
+            "follow_up_tests": [],
+            "specialists": specialists 
+        })
+        
+        if rad_analysis['abnormalities']:
+            result['risks'].append({"type": "Imaging Finding", "status": "Observation", "detail": "Abnormalities detected in scan."})
+            
+    else:
+        # Lab / General
+        specialists = get_recommended_specialists(risks, "Lab")
+        
+        # Patient View (driven by raw text or summaries? Summaries are safer/simpler)
+        # But 'explain_to_patient' expects text. Let's use raw sections for now to be safe.
+        patient_findings = explain_to_patient(raw_sections.get('findings', ''))
+        patient_impression = explain_to_patient(raw_sections.get('impression', ''))
+        
+        severity = {
+            "findings": detect_severity(raw_sections.get('findings', '')),
+            "impression": detect_severity(raw_sections.get('impression', ''))
+        }
+        
+        comparison = {}
+        if previous_text:
+            prev_labs = extract_labs_regex(previous_text)
+            labs = compare_labs(labs, prev_labs)
+            comparison = {
+                "previous_labs": prev_labs,
+                "diff_summary": f"Compared against previous report." 
+            }
+            
+        result.update({
+            "patient_view": {
+                "findings": patient_findings,
+                "impression": patient_impression,
+                "explanation": "Simplified medical terms are shown in parentheses."
+            },
+            "severity": severity,
+            "labs": labs,
+            "risks": risks,
+            "recommendations": recommendations,
+            "follow_up_tests": follow_up_tests,
+            "comparison": comparison,
+            "specialists": specialists
+        })
+
+    return result
 
 def explain_to_patient(text):
     """
