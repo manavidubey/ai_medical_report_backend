@@ -477,14 +477,17 @@ def detect_severity(text):
 
 def extract_labs_regex(text):
     """
-    Improved regex to catch more variations (plain and bracketed types).
+    Improved regex to catch labs, units, and ranges.
+    Prioritizes Lab Report Range > System Default.
     """
     labs = []
     
-    # Pattern 1: Name: Value Unit (e.g. Hemoglobin: 13.5 g/dL)
-    # Also catches: Name 13.5 Unit (no colon)
-    # Updated to handle Ranges like [ 13.0 - 17.0 ] usually appearing after value/unit
-    pattern = re.compile(r"([A-Za-z\s\(\)\-\.]+?)[:\s]+(\d+(?:\.\d+)?)\s*([a-zA-Z%\^/0-9]+)")
+    # Pattern: Name: Value Unit [Range?]
+    # Groups: 1=Name, 2=Value, 3=Unit, 4=Range(Optional)
+    # Range patterns matched: (10-20), 10.0 - 20.0, > 50, < 100
+    pattern = re.compile(
+        r"([A-Za-z0-9\s\(\)\-\.]+?)[:\s]+(\d+(?:\.\d+)?)\s*([a-zA-Z%\^/0-9]+)\s*(?:[\(\[]?(\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?|[<>]\s*\d+(?:\.\d+)?)[\)\]]?)?"
+    )
     
     found_names = set()
 
@@ -492,28 +495,67 @@ def extract_labs_regex(text):
         raw_name = match.group(1).strip()
         value = float(match.group(2))
         unit = match.group(3).strip()
+        raw_range = match.group(4)
         
-        if len(raw_name) < 2 or raw_name.lower() in ["page", "date", "dob", "specimen", "patient", "collected", "reported"]:
+        if len(raw_name) < 2 or raw_name.lower() in ["page", "date", "dob", "specimen", "patient", "collected", "reported", "result", "investigation"]:
             continue
             
         normalized = normalize_name(raw_name)
-        ref = REFERENCE_RANGES.get(normalized)
+        system_ref = REFERENCE_RANGES.get(normalized)
         
         # Validation: If not in our KB, check if unit looks "lab-like"
-        known_units = ["mg/dl", "g/dl", "u/l", "mmol/l", "%", "x10^3/ul", "fl", "pg", "iu/l"]
-        if not ref and unit.lower() not in known_units:
+        known_units = ["mg/dl", "g/dl", "u/l", "mmol/l", "%", "x10^3/ul", "fl", "pg", "iu/l", "ng/ml", "ug/dl", "ratio"]
+        if not system_ref and unit.lower() not in known_units:
             continue
 
         if normalized in found_names: continue
 
         status = "Normal"
+        ref_source = "Unknown"
         ref_str = "N/A"
         
-        if ref:
-            ref_str = f"{ref['min']}-{ref['max']} {ref['unit']}"
-            if value < ref['min']:
+        # 1. Try Lab Provided Range (Primary)
+        lab_min = None
+        lab_max = None
+        
+        if raw_range:
+            try:
+                # Handle "10 - 20"
+                if "-" in raw_range or "–" in raw_range:
+                    parts = re.split(r"[-–]", raw_range)
+                    if len(parts) == 2:
+                        lab_min = float(parts[0].strip())
+                        lab_max = float(parts[1].strip())
+                        ref_str = f"{lab_min} - {lab_max} {unit}"
+                        ref_source = "Lab Report"
+                # Handle "< 100" or "> 50"
+                elif "<" in raw_range:
+                     val = float(raw_range.replace("<", "").strip())
+                     lab_max = val
+                     lab_min = 0 # assumption for things like cholesterol
+                     ref_str = f"< {val} {unit}"
+                     ref_source = "Lab Report"
+                elif ">" in raw_range:
+                     val = float(raw_range.replace(">", "").strip())
+                     lab_min = val
+                     lab_max = float('inf')
+                     ref_str = f"> {val} {unit}"
+                     ref_source = "Lab Report"
+            except:
+                pass # parsing failed, fall back
+        
+        # 2. Fallback to System Default (Secondary)
+        if ref_source == "Unknown" and system_ref:
+            lab_min = system_ref['min']
+            lab_max = system_ref['max']
+            ref_str = f"{lab_min} - {lab_max} {system_ref['unit']}"
+            ref_source = "System Default"
+            
+        # 3. Calculate Status
+        if lab_min is not None and lab_max is not None:
+            if value < lab_min:
                 status = "Low"
-            elif value > ref['max']:
+            elif value > lab_max:
                 status = "High"
         
         labs.append({
@@ -522,7 +564,8 @@ def extract_labs_regex(text):
             "value": value,
             "unit": unit,
             "status": status,
-            "reference": ref_str
+            "reference": ref_str,
+            "source": ref_source
         })
         found_names.add(normalized)
         
