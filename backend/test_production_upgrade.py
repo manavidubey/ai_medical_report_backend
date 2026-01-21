@@ -51,7 +51,23 @@ def test_production_upgrade():
         print("SUCCESS: Labs extracted structurally.")
     else:
         print(f"FAILURE: Labs extraction count {len(result_lab['structured_labs'])}")
-        
+
+    # Test 3: Ad Filtration
+    text_ads = """
+    Hemoglobin: 13.0 g/dL
+    Special Offer: Full Body Checkup @ 999
+    Powered by HealthTech AI
+    ISO 9001 Certified Lab
+    """
+    print("\n>>> Testing Ad Filtration...")
+    result_ads = process_clinical_document(text_ads)
+    labs = result_ads["structured_labs"]
+    ad_lines = [l for l in labs if "Offer" in l['name'] or "ISO" in l['name']]
+    if len(labs) == 1 and not ad_lines:
+        print("SUCCESS: Advertisements filtered out.")
+    else:
+        print(f"FAILURE: Ads detected as labs: {ad_lines}")
+
     print("\nProduction Verification Complete.")
 
 if __name__ == "__main__":

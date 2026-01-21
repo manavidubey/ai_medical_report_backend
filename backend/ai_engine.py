@@ -734,6 +734,11 @@ def extract_labs_regex(text):
         if len(raw_name) < 2 or raw_name.lower() in ["page", "date", "dob", "specimen", "patient", "collected", "reported", "result", "investigation"]:
             continue
             
+        # Ad / Noise Filter
+        raw_lower = match.group(0).lower()
+        if any(x in raw_lower for x in ["discount", "package", "offer", "visit us", "www.", "iso", "nabl", "cap accredited", "technology", "powered by"]):
+            continue
+            
         normalized = normalize_name(raw_name)
         system_ref = REFERENCE_RANGES.get(normalized)
         
