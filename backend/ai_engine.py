@@ -468,6 +468,128 @@ class ClinicalParser:
         print(f"Detected {len(found_sections)} sections: {list(found_sections.keys())}")
         return found_sections
 
+def extract_demographics(text):
+    """
+    Extracts Patient Age, Gender, and potentially Name.
+    """
+    demographics = {"age": None, "gender": "Unknown", "name": "Unknown"}
+    
+    # 1. AGE
+    # Patterns: "Age: 45", "45 Y/O", "45 Years"
+    age_match = re.search(r"(?:Age|yg|y\.o\.|years? old)[:\s]*(\d{1,3})", text, re.IGNORECASE)
+    if age_match:
+        demographics["age"] = int(age_match.group(1))
+        
+    # 2. GENDER
+    # Patterns: "Sex: Male", "Gender: F", "Male", "Female" (contextual?)
+    # We look for explicit lables to avoid false positives
+    if re.search(r"(?:Sex|Gender)[:\s]*(?:Male|M\b)", text, re.IGNORECASE):
+        demographics["gender"] = "Male"
+    elif re.search(r"(?:Sex|Gender)[:\s]*(?:Female|F\b)", text, re.IGNORECASE):
+        demographics["gender"] = "Female"
+    elif re.search(r"\bMale\b", text, re.IGNORECASE) and not re.search(r"\bFemale\b", text, re.IGNORECASE):
+         # Checking strictly for standalone words if label missing (riskier but useful)
+         demographics["gender"] = "Male"
+    elif re.search(r"\bFemale\b", text, re.IGNORECASE):
+         demographics["gender"] = "Female"
+
+    # 3. NAME
+    # Hard to do reliably without NER, but we can try heuristic
+    # "Patient Name: John Doe", "Name: Jane Doe"
+    name_match = re.search(r"(?:Patient Name|Name)[:\s]+([A-Za-z\s\.]+)(?:\n|$|\s{2,})", text, re.IGNORECASE)
+    if name_match:
+        raw_name = name_match.group(1).strip()
+        if len(raw_name) > 2 and len(raw_name) < 40:
+            demographics["name"] = raw_name.title()
+            
+    return demographics
+
+def extract_vitals(text):
+    """
+    Extracts BP, Heart Rate, BMI, Temperature.
+    """
+    vitals = []
+    
+    # 1. Blood Pressure (e.g. 120/80 mmHg)
+    bp_match = re.search(r"\b(\d{2,3})[/\\](\d{2,3})\b(?:mmHg)?", text, re.IGNORECASE)
+    if bp_match:
+        systolic = int(bp_match.group(1))
+        diastolic = int(bp_match.group(2))
+        # Sanity check
+        if 50 < systolic < 250 and 30 < diastolic < 150:
+            status = "Normal"
+            if systolic > 130 or diastolic > 80: status = "Elevated"
+            if systolic > 140 or diastolic > 90: status = "High (Hypertension)"
+            vitals.append({"name": "Blood Pressure", "value": f"{systolic}/{diastolic}", "unit": "mmHg", "status": status})
+
+    # 2. Heart Rate / Pulse
+    hr_match = re.search(r"(?:Heart Rate|Pulse|HR)[:\s]+(\d{2,3})", text, re.IGNORECASE)
+    if hr_match:
+        hr = int(hr_match.group(1))
+        status = "Normal"
+        if hr > 100: status = "High (Tachycardia)"
+        elif hr < 60: status = "Low (Bradycardia)"
+        vitals.append({"name": "Heart Rate", "value": hr, "unit": "bpm", "status": status})
+
+    # 3. BMI
+    bmi_match = re.search(r"(?:BMI|Body Mass Index)[:\s]+(\d{1,2}(?:\.\d)?)", text, re.IGNORECASE)
+    if bmi_match:
+        bmi = float(bmi_match.group(1))
+        status = "Normal"
+        if bmi >= 25: status = "Overweight"
+        if bmi >= 30: status = "Obese"
+        vitals.append({"name": "BMI", "value": bmi, "unit": "kg/m²", "status": status})
+
+    # 4. SpO2
+    spo2_match = re.search(r"(?:SpO2|Saturation)[:\s]+(\d{2,3})", text, re.IGNORECASE)
+    if spo2_match:
+        ox = int(spo2_match.group(1))
+        status = "Normal"
+        if ox < 95: status = "Low (Hypoxia)"
+        vitals.append({"name": "Oxygen Saturation", "value": ox, "unit": "%", "status": status})
+        
+    return vitals
+
+def extract_medications(text):
+    """
+    Extracts list of medications using heuristic keywords and list format detection.
+    """
+    meds = []
+    
+    # Locate section
+    # Search for "Current Medications", "Rx", "Treatment" followed by list items
+    
+    # Simple strategy: Find "Medications:" header and grab lines until next header
+    start_match = re.search(r"(?:Current Medications|Medications|Tx|Rx)[:\n]", text, re.IGNORECASE)
+    if start_match:
+        start_idx = start_match.end()
+        # Look for next double newline or Header-like pattern
+        sub_text = text[start_idx:]
+        lines = sub_text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # Stop if we hit a likely new header (All caps, ending in colon?)
+            if re.match(r"^[A-Z\s]+:$", line) or len(meds) > 15: # Safety break
+                break
+                
+            # If line is short and looks like a list item
+            # Remove bullets
+            clean_line = re.sub(r"^[\d\-\.\*\)]+\s*", "", line)
+            
+            # Heuristic: Valid med line is usually < 50 chars, has letters
+            if 3 < len(clean_line) < 60 and re.search(r"[a-zA-Z]", clean_line):
+                # Check for common dosage keywords to confirm it's a med
+                if re.search(r"(?:mg|mcg|ml|tablet|capsule|daily|qn|bd|od|tds)", clean_line, re.IGNORECASE):
+                    meds.append(clean_line)
+                # Or if implies a list
+                elif line.startswith("-") or line[0].isdigit():
+                     meds.append(clean_line)
+                     
+    return meds
+
 def process_clinical_document(text):
     """
     Orchestrator: Differentiated Processing Strategy.
@@ -483,8 +605,17 @@ def process_clinical_document(text):
         "lab_abnormalities": [],
         "section_summaries": {},
         "clinical_risks": [],
-        "recommendations": []
+        "recommendations": [],
+        "demographics": {},
+        "vitals": [],
+        "medications": []
     }
+    
+    # 0. Advanced IQ: Demographics & Vitals (Run on full text or specific headers)
+    # Demographics usually at top
+    processed_data["demographics"] = extract_demographics(text[:5000]) # First 5k chars usually
+    processed_data["vitals"] = extract_vitals(text) # Vitals can be anywhere
+    processed_data["medications"] = extract_medications(text)
     
     # 1. Process Lab Data specifically
     lab_text_source = sections.get('labs', "")
