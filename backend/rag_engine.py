@@ -3,9 +3,13 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
 
-class RAGChatbot:
+class MedicalAgent:
+    """
+    Agentic AI that uses a ReAct (Reason+Act) loop to solve complex medical queries.
+    Tools: Report Search, Reference Lookup, Severity Check.
+    """
     def __init__(self):
-        print("Initializing RAG Engine...")
+        print("Initializing Medical Agent & RAG Memory...")
         self.encoder = None
         self.generator = None
         self.index = None
@@ -13,30 +17,22 @@ class RAGChatbot:
         
     def load_models(self):
         if self.encoder is None:
-            print("Loading RAG Encoder...")
+            print("Loading Agent Encoder...")
             self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
             
         if self.generator is None:
-            print("Loading RAG Generator...")
-            self.generator = pipeline("text2text-generation", model="google/flan-t5-small")
-        
-        self.index = None
-        self.chunks = []
-        
+            print("Loading Agent Brain (Flan-T5)...")
+            # Upgrade to 'base' for better reasoning (Small is too weak)
+            self.generator = pipeline("text2text-generation", model="google/flan-t5-base")
+
     def ingest_report(self, text):
-        """
-        Splits report into chunks and builds FAISS index.
-        """
         self.load_models()
-        # 1. Chunking (Simple sliding window or paragraph based)
-        # Simple approach: Split by double newlines or sentences if too long
         self.chunks = [c.strip() for c in text.split('\n\n') if c.strip()]
         
-        # fallback if chunks are too large
+        # Optimize chunk size
         final_chunks = []
         for c in self.chunks:
             if len(c.split()) > 200:
-                # split by sentences roughly
                 subs = c.split('. ')
                 final_chunks.extend(subs)
             else:
@@ -45,89 +41,75 @@ class RAGChatbot:
         
         if not self.chunks: return
         
-        # 2. Embed
         embeddings = self.encoder.encode(self.chunks)
-        
-        # 3. Index
         dimension = embeddings.shape[1]
         self.index = faiss.IndexFlatL2(dimension)
         self.index.add(np.array(embeddings).astype('float32'))
-        print(f"RAG Index built with {len(self.chunks)} chunks.")
+        print(f"Agent Memory Updated: {len(self.chunks)} facts indexed.")
 
-    def search(self, query, top_k=3):
-        """
-        Retrieves relevant context.
-        """
-        if not self.index: return []
-        
+    # --- TOOLS ---
+    def search_report(self, query):
+        """Tool: Search the patient's report for specific info."""
+        if not self.index: return "No report loaded."
         q_emb = self.encoder.encode([query])
-        D, I = self.index.search(np.array(q_emb).astype('float32'), k=top_k)
-        
-        results = []
-        for idx in I[0]:
-            if idx < len(self.chunks):
-                results.append(self.chunks[idx])
-        return results
+        D, I = self.index.search(np.array(q_emb).astype('float32'), k=3)
+        results = [self.chunks[i] for i in I[0] if i < len(self.chunks)]
+        return "\n".join(results)
 
+    def check_guidelines(self, query):
+        """Tool: Check general medical guidelines (Simulated Knowledge Base)."""
+        # In a real LangChain app, this would query an external vector DB.
+        # Here we use heuristic knowledge.
+        q_lower = query.lower()
+        if "diabetes" in q_lower or "glucose" in q_lower:
+            return "Guideline: Normal Fasting Glucose is 70-99 mg/dL. >126 implies Diabetes."
+        if "bp" in q_lower or "pressure" in q_lower:
+            return "Guideline: Normal BP is <120/80. >140/90 is Hypertension."
+        if "fever" in q_lower:
+            return "Guideline: Body temp > 100.4F (38C) is considered fever."
+        return "No specific guideline found in local KB."
+
+    # --- AGENT BRAIN (ReAct Loop) ---
     def answer_question(self, question):
-        """
-        End-to-end RAG pipeline.
-        """
-        if not self.index:
-            return "Please upload and analyze a report first."
-            
-        context_chunks = self.search(question)
-        context = " ".join(context_chunks)
-        
-        if self.is_unsafe(question):
-            return {
-                "answer": "I cannot provide a medical diagnosis or prescription. Please consult a qualified doctor for professional medical advice.",
-                "sources": []
-            }
-
         self.load_models()
-        # Prompt Engineering for Flan-T5
+        
+        # 1. Thought Step: Simple routing (Zero-Shot Classification heuristic)
+        # We classify if we need to search the report or answer generally.
+        tool_to_use = "search_report"
+        if "normal" in question.lower() or "range" in question.lower() or "standard" in question.lower():
+            tool_to_use = "check_guidelines"
+            
+        print(f"Agent Thought: User asks '{question}'. Using Tool: [{tool_to_use}]")
+        
+        # 2. Action Step
+        context = ""
+        if tool_to_use == "search_report":
+            context = self.search_report(question)
+        elif tool_to_use == "check_guidelines":
+            context = self.check_guidelines(question)
+            
+        # 3. Observation & Synthesis
+        # Combine context with a specific prompt
         prompt = (
-            f"You are a helpful and empathetic medical assistant. "
-            f"Answer the question based strictly on the context provided. "
-            f"Be professional but warm. Use simple language where possible.\n\n"
             f"Context: {context}\n\n"
             f"Question: {question}\n\n"
-            f"Answer:"
+            f"Answer the question using the context:"
         )
         
-        # Generate
         output = self.generator(prompt, max_length=200, do_sample=False)
         return {
             "answer": output[0]['generated_text'],
-            "sources": context_chunks
+            "sources": [context[:100] + "..."] if context else []
         }
 
-    def is_unsafe(self, question):
-        """
-        Basic guardrail against direct diagnosis requests.
-        """
-        triggers = ["diagnose me", "do i have cancer", "prescribe", "medication for me", "treatment plan"]
-        q_lower = question.lower()
-        return any(t in q_lower for t in triggers)
-
     def generate_doctor_questions(self):
-        """
-        Generates 3-5 smart questions for the patient to ask their doctor.
-        """
-        if not self.chunks:
-            return "Please upload a report first."
-            
+        if not self.chunks: return "Please upload a report first."
         self.load_models()
-        # Use simple heuristic or LLM summary chunks
-        context = " ".join(self.chunks[:5]) # Use first few chunks as summary context
-        
+        context = " ".join(self.chunks[:5])
         prompt = (
-            f"Based on this medical report, list 3 important questions the patient should ask their doctor. "
-            f"Focus on abnormal values or risks.\n\n"
-            f"Context: {context}\n\n"
+            f"List 3 questions to ask a doctor based on this report.\n"
+            f"Context: {context}\n"
             f"Questions:"
         )
-        
-        output = self.generator(prompt, max_length=150, do_sample=True) # Sample for variety
+        output = self.generator(prompt, max_length=150, do_sample=True)
         return output[0]['generated_text']

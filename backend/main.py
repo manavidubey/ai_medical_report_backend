@@ -8,10 +8,15 @@ import io
 import json
 import pdfplumber
 import docx
-from ai_engine import analyze_full_report, analyze_medical_image
+from ai_engine import (
+    analyze_full_report,
+    analyze_medical_image,
+    explain_to_patient
+)
 from report_generator import create_pdf
-from rag_engine import RAGChatbot
+from rag_engine import MedicalAgent
 from gtts import gTTS
+from pdf_processor import process_pdf
 
 app = FastAPI()
 
@@ -24,14 +29,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize Agents
+medical_agent = MedicalAgent()
+
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 REPORTS_DIR = "reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# Initialize RAG System
-rag_system = RAGChatbot()
-from pdf_processor import process_pdf
+
 
 def extract_text_from_file(filepath):
     """
@@ -63,7 +69,8 @@ def extract_text_from_file(filepath):
 @app.post("/analyze")
 async def analyze_report(
     current_file: UploadFile = File(...),
-    previous_file: Optional[UploadFile] = File(None)
+    previous_file: Optional[UploadFile] = File(None),
+    location: Optional[str] = Form(None)
 ):
     try:
         # Check if Image
@@ -112,10 +119,10 @@ async def analyze_report(
             prev_text = extract_text_from_file(prev_path)
 
         # Analyze
-        result = analyze_full_report(curr_text, prev_text)
+        result = analyze_full_report(curr_text, prev_text, location)
         
         # Ingest into RAG
-        rag_system.ingest_report(curr_text)
+        medical_agent.ingest_report(curr_text)
         
         return JSONResponse(result)
         
@@ -130,7 +137,7 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    response = rag_system.answer_question(request.question)
+    response = medical_agent.answer_question(request.question)
     return response
 
 @app.post("/generate-pdf")
@@ -147,7 +154,7 @@ async def generate_pdf_endpoint(
 
 @app.post("/generate-questions")
 async def generate_questions_endpoint():
-    response = rag_system.generate_doctor_questions()
+    response = medical_agent.generate_doctor_questions()
     return {"questions": response}
 
 @app.post("/generate-referral")

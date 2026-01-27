@@ -1,8 +1,27 @@
-import spacy
 import re
 import json
+import os
+import time
+import io
+import requests
+import concurrent.futures
+import statistics
+from PIL import Image
+import spacy
 from transformers import pipeline
 from deepdiff import DeepDiff
+try:
+    from duckduckgo_search import DDGS
+    HAS_DDG = True
+except ImportError:
+    HAS_DDG = False
+    print("DuckDuckGo Search not installed. Using mock data.")
+
+try:
+    import googlemaps
+    HAS_GOOGLE_MAPS = True
+except ImportError:
+    HAS_GOOGLE_MAPS = False
 
 # Global Model Variables (Lazy Loaded)
 summarizer = None
@@ -324,7 +343,12 @@ REFERENCE_RANGES = {
     "pao2": {"min": 75, "max": 100, "unit": "mmHg"},
     "paco2": {"min": 35, "max": 45, "unit": "mmHg"},
     "hco3": {"min": 22, "max": 26, "unit": "mEq/L"},
-    "o2 saturation": {"min": 95, "max": 100, "unit": "%"}
+    "o2 saturation": {"min": 95, "max": 100, "unit": "%"},
+
+    # 19. IRON STUDIES
+    "iron": {"min": 60, "max": 170, "unit": "ug/dL"},
+    "ferritin": {"min": 30, "max": 300, "unit": "ng/mL"},
+    "tibc": {"min": 250, "max": 450, "unit": "ug/dL"},
 }
 
 # Simple Medical Dictionary for Patient Translation
@@ -351,12 +375,15 @@ SYNONYMS = {
     "hgb": "hemoglobin",
     "total cholesterol": "cholesterol",
     "t. chol": "cholesterol",
+    "t chol": "cholesterol",
     "fbs": "glucose",
     "blood sugar": "glucose",
     "f.b.s": "glucose",
+    "glucose - fasting": "glucose",
     "cre": "creatinine",
     "creat": "creatinine",
     "s. creatinine": "creatinine",
+    "s creatinine": "creatinine",
     "sgot": "ast",
     "asparts aminotransferase": "ast",
     "sgpt": "alt",
@@ -369,8 +396,10 @@ SYNONYMS = {
     "a1c": "hba1c",
     "hba1c": "hba1c",
     "glycated hemoglobin": "hba1c",
+    "glycosylated hemoglobin": "hba1c",
     "tlc": "wbc count",
     "total leukocyte count": "wbc count",
+    "total leucocyte count": "wbc count",
     "dlc": "differential", # Generic mapping
     "neutrophils": "neutrophils", # Ensure self-mapping exists
     "polymorphs": "neutrophils",
@@ -379,9 +408,14 @@ SYNONYMS = {
     "eosinophils": "eosinophils",
     "basophils": "basophils",
     "r.b.c": "rbc count",
+    "rbc": "rbc count",
     "w.b.c": "wbc count",
+    "wbc": "wbc count",
     "tec": "eosinophils",
-    "absolute eosinophil count": "eosinophils" # Approximation
+    "absolute eosinophil count": "eosinophils", # Approximation
+    "iron serum": "iron",
+    "unsaturated iron binding capacity": "uibc",
+    "total iron binding capacity": "tibc"
 }
 
 def normalize_name(name):
@@ -389,20 +423,35 @@ def normalize_name(name):
     return SYNONYMS.get(clean, clean)
 
 def extract_sections(text):
-    # (Unchanged extraction logic)
-    # ... (Keep existing extract_sections code, assuming it's robust enough for now)
-    # Re-pasting extract_sections header to match replace block signature if needed
-    # But since we are editing a block, let's keep it focused or use multi-replace if widely separated.
-    # The user asked for "Universal robustness", focusing on Synonyms + Regex.
-    # We are replacing chunk starting from SYNONYMS down to extract_labs_regex start.
-    pass 
-    # WAIT, I cannot replace just a function start without providing the full function body if the TargetContent spans across.
-    # Let's adjust the range strictly to SYNONYMS first, then Regex separately.
-    pass
+    """
+    Extract high-level document sections (history/findings/impression/labs/advice).
 
-# Correcting strategy: Split into two edits. 
-# 1. Update SYNONYMS
-# 2. Update extract_labs_regex logic
+    This is used by tests and downstream logic; it must never return None.
+    """
+    if not text:
+        return {
+            "history": "",
+            "findings": "",
+            "impression": "",
+            "labs": "",
+            "advice": "",
+            "full_text": ""
+        }
+
+    try:
+        sections = ClinicalParser().parse(text)
+        if not isinstance(sections, dict):
+            sections = {"full_text": text}
+    except Exception:
+        sections = {"full_text": text}
+
+    # Ensure stable keys for callers/tests
+    for k in ["history", "findings", "impression", "labs", "advice"]:
+        sections.setdefault(k, "")
+        if sections[k] is None:
+            sections[k] = ""
+    sections.setdefault("full_text", text)
+    return sections
 
 
 class ClinicalParser:
@@ -413,7 +462,7 @@ class ClinicalParser:
     def __init__(self):
         # Maps standard keys to list of potential regex variations
         self.section_patterns = {
-            "labs": [r"laboratory data", r"investigation", r"haematology", r"biochemistry", r"lab results", r"test name"],
+            "labs": [r"laboratory data", r"investigation", r"haematology", r"biochemistry", r"lab results", r"test name", r"doctor summary"],
             "history": [r"clinical history", r"history", r"clinical indication", r"reason for exam"],
             "findings": [r"findings", r"technique", r"examination", r"procedure", r"comments", r"report"],
             "impression": [r"impression", r"conclusion", r"diagnosis", r"summary", r"opinion"],
@@ -475,32 +524,38 @@ def extract_demographics(text):
     demographics = {"age": None, "gender": "Unknown", "name": "Unknown"}
     
     # 1. AGE
-    # Patterns: "Age: 45", "45 Y/O", "45 Years"
     age_match = re.search(r"(?:Age|yg|y\.o\.|years? old)[:\s]*(\d{1,3})", text, re.IGNORECASE)
     if age_match:
         demographics["age"] = int(age_match.group(1))
         
     # 2. GENDER
-    # Patterns: "Sex: Male", "Gender: F", "Male", "Female" (contextual?)
-    # We look for explicit lables to avoid false positives
     if re.search(r"(?:Sex|Gender)[:\s]*(?:Male|M\b)", text, re.IGNORECASE):
         demographics["gender"] = "Male"
     elif re.search(r"(?:Sex|Gender)[:\s]*(?:Female|F\b)", text, re.IGNORECASE):
         demographics["gender"] = "Female"
     elif re.search(r"\bMale\b", text, re.IGNORECASE) and not re.search(r"\bFemale\b", text, re.IGNORECASE):
-         # Checking strictly for standalone words if label missing (riskier but useful)
-         demographics["gender"] = "Male"
+        demographics["gender"] = "Male"
     elif re.search(r"\bFemale\b", text, re.IGNORECASE):
-         demographics["gender"] = "Female"
-
+        demographics["gender"] = "Female"
+        
     # 3. NAME
-    # Hard to do reliably without NER, but we can try heuristic
-    # "Patient Name: John Doe", "Name: Jane Doe"
-    name_match = re.search(r"(?:Patient Name|Name)[:\s]+([A-Za-z\s\.]+)(?:\n|$|\s{2,})", text, re.IGNORECASE)
+    # Patterns: "Patient Name: John Doe", "Name: John Doe", "Patient: John Doe"
+    name_match = re.search(r"(?:Patient Name|Name|Patient)[:\s]+([A-Za-z\s\.]+)(?:\n|$|\s{2,})", text, re.IGNORECASE)
     if name_match:
         raw_name = name_match.group(1).strip()
-        if len(raw_name) > 2 and len(raw_name) < 40:
+        # Filter out if it captured too much (e.g. "Patient: 45 Male")
+        if not any(char.isdigit() for char in raw_name) and len(raw_name) > 2 and len(raw_name) < 40:
             demographics["name"] = raw_name.title()
+
+    # 4. DATE
+    date_match = re.search(r"(?:Date|Report Date|Collected)[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", text, re.IGNORECASE)
+    if date_match:
+        demographics["date"] = date_match.group(1)
+
+    # 5. LOCATION (Area/City)
+    loc_match = re.search(r"(?:Location|City|Area|Address)[:\s]+([A-Za-z\s]{2,30})(?:\n|$|,)", text, re.IGNORECASE)
+    if loc_match:
+        demographics["location"] = loc_match.group(1).strip()
             
     return demographics
 
@@ -540,14 +595,6 @@ def extract_vitals(text):
         if bmi >= 30: status = "Obese"
         vitals.append({"name": "BMI", "value": bmi, "unit": "kg/m²", "status": status})
 
-    # 4. SpO2
-    spo2_match = re.search(r"(?:SpO2|Saturation)[:\s]+(\d{2,3})", text, re.IGNORECASE)
-    if spo2_match:
-        ox = int(spo2_match.group(1))
-        status = "Normal"
-        if ox < 95: status = "Low (Hypoxia)"
-        vitals.append({"name": "Oxygen Saturation", "value": ox, "unit": "%", "status": status})
-        
     return vitals
 
 def extract_medications(text):
@@ -590,9 +637,9 @@ def extract_medications(text):
                      
     return meds
 
-def process_clinical_document(text):
+def process_clinical_document(text, previous_text=None, user_location=None):
     """
-    Orchestrator: Differentiated Processing Strategy.
+    Orchestrator: Differentiated Processing Strategy with optional Comparison.
     """
     print("\n--- Processing Clinical Document ---")
     parser = ClinicalParser()
@@ -600,33 +647,46 @@ def process_clinical_document(text):
     
     # Data Containers
     processed_data = {
-        "raw_sections": sections, # Added for Frontend Display
+        "report_type": detect_report_type(text),
+        "raw_sections": sections, 
         "structured_labs": [],
         "lab_abnormalities": [],
         "section_summaries": {},
-        "clinical_risks": [],
+        "risks": [], # Mapped from clinical_risks
         "recommendations": [],
         "demographics": {},
         "vitals": [],
-        "medications": []
+        "medications": [],
+        "specialists": [],
+        "summary": "",
+        "patient_view": {"findings": "", "impression": ""}
     }
     
-    # 0. Advanced IQ: Demographics & Vitals (Run on full text or specific headers)
-    # Demographics usually at top
-    processed_data["demographics"] = extract_demographics(text[:5000]) # First 5k chars usually
-    processed_data["vitals"] = extract_vitals(text) # Vitals can be anywhere
+    # 0. Advanced IQ: Demographics & Vitals
+    processed_data["demographics"] = extract_demographics(text[:5000]) 
+    processed_data["vitals"] = extract_vitals(text) 
     processed_data["medications"] = extract_medications(text)
     
-    # 1. Process Lab Data specifically
-    lab_text_source = sections.get('labs', "")
-    if not lab_text_source and "full_text" in sections:
-        lab_text_source = sections["full_text"] # Fallback
-    
+    # 1. Process Lab Data
     all_labs = extract_labs_regex(text) 
     processed_data["structured_labs"] = all_labs
     processed_data["lab_abnormalities"] = [l for l in all_labs if l['status'] != "Normal"]
     
-    # 2. Process Narrative Sections (History, Findings, Impression)
+    # Risky Business
+    risks = calculate_risk(all_labs)
+    processed_data["risks"] = risks # Matches App.jsx
+    processed_data["recommendations"] = generate_recommendations(all_labs, risks)
+    print("DEBUG: Getting Specialists...")
+    # Use user provided location first, else falling back to extracted info
+    final_location = user_location or processed_data["demographics"].get("location")
+    processed_data["specialists"] = get_recommended_specialists(risks, "Lab", final_location)
+    print(f"DEBUG: Specialists Done for {final_location}.")
+    
+    # Enrich Abnormal Labs with "Deep Insight"
+    processed_data["structured_labs"] = enrich_abnormalities(all_labs)
+    processed_data["lab_abnormalities"] = [l for l in processed_data["structured_labs"] if l['status'] != "Normal"]
+
+    # 2. Process Narrative Sections
     for sec_key in ["history", "findings", "impression"]:
         content = sections.get(sec_key, "")
         if not content: continue
@@ -637,66 +697,124 @@ def process_clinical_document(text):
         if word_count < 50:
             processed_data["section_summaries"][sec_key] = content
         elif word_count > 800:
-            processed_data["section_summaries"][sec_key] = summarize_text(content) 
+            processed_data["section_summaries"][sec_key] = summarize_text(content)
         else:
-            model = get_summarizer()
-            if model:
-                try:
-                    res = model(content, max_length=150, min_length=40, do_sample=False, truncation=True)
-                    processed_data["section_summaries"][sec_key] = res[0]['summary_text']
-                except:
-                     processed_data["section_summaries"][sec_key] = content[:500] + "..."
-            else:
-                 processed_data["section_summaries"][sec_key] = content[:500] + "..."
+             processed_data["section_summaries"][sec_key] = content # Keep original if medium size
 
-    # 3. Calculate Risks
-    processed_data["clinical_risks"] = calculate_risk(all_labs)
-    processed_data["recommendations"] = generate_recommendations(all_labs, processed_data["clinical_risks"])
+    # 3. Final Synthesis & Patient View
+    processed_data["summary"] = synthesize_report(processed_data)
     
-    return processed_data
+    # --- ENHANCED PATIENT VIEW ---
+    patient_narrative = synthesize_patient_view(processed_data)
+    processed_data["patient_view"] = {
+        "findings": patient_narrative["findings"],
+        "impression": patient_narrative["impression"],
+        "explanation": "Simplified medical overview for patients."
+    }
+    
+    # 4. Comparison (Optional)
+    if previous_text:
+        prev_labs = extract_labs_regex(previous_text)
+        # Simple diff logic can be added here
+        print("Comparing with previous report...")
+        # Access trend analysis function if available
+        processed_data["structured_labs"] = compare_labs(processed_data["structured_labs"], prev_labs)
+        # processed_data["comparison"] = comparison
+
+    return processed_data 
+
+def clean_ads_and_noise(text):
+    """
+    Best-effort removal of common footer/boilerplate noise from reports.
+    """
+    clean = text or ""
+    noise_patterns = [
+        r"This test has been performed at.*",
+        r"TATA 1MG.*",
+        r"Powered by.*",
+        r"Page \d+ of \d+",
+        r"Sample collected at.*",
+        r"Order Medicines.*",
+        r"EXPLORE NOW.*",
+        r"Terms and Conditions.*",
+        r"support@.*",
+        r"care@.*",
+        r"www\..*",
+        r"Reference\s*:\s*American Diabetes Association.*",
+        r"\d{2,}\s*or\s*(?:above|below).*Normal.*",
+        r"\d{2,}\s*to\s*\d{2,}.*Pre-Diabetes.*",
+        r"\d{2,}\s*or\s*above.*Diabetes.*",
+        r"It is advised to read this in conjunction.*",
+        r"Clinical Impression of clinically significant parameters.*"
+    ]
+    for pat in noise_patterns:
+        clean = re.sub(pat, "", clean, flags=re.IGNORECASE)
+    return clean.strip()
+
 
 def synthesize_report(processed_data):
     """
-    Hierarchical Synthesis of the final report.
+    Enhanced Professional Clinical Summary.
+    Structure: Overview -> Impression -> Lab Abnormalities -> Imaging -> Plan
     """
+    processed_data = processed_data or {}
     report_lines = []
     
-    # 1. Header & Context
-    report_lines.append("# Clinical Intelligence Report")
-    
-    # 2. Critical Findings (The "Red" Items)
-    risks = processed_data.get("clinical_risks", [])
-    abnormal_labs = processed_data.get("lab_abnormalities", [])
-    
-    if risks or abnormal_labs:
-        report_lines.append("\n## 🚨 Critical Findings & Risks")
-        for risk in risks:
-            report_lines.append(f"- **{risk['type']}**: {risk['status']} ({risk['detail']})")
-        for lab in abnormal_labs:
-            report_lines.append(f"- **{lab['name']}**: {lab['value']} {lab['unit']} ({lab['status']}) [Ref: {lab['reference']}]")
-            
-    # 3. Clinical Narrative (Synthesized from sections)
+    # 0. Overview
+    demo = processed_data.get("demographics", {})
+    name = demo.get("name", "Unknown Patient")
+    date = demo.get("date", "Unknown Date")
+    report_lines.append(f"REPORT OVERVIEW")
+    report_lines.append(f"Patient: {name} | Date: {date}")
+    report_lines.append("---")
+
+    # 1. Clinical Impression
     summaries = processed_data.get("section_summaries", {})
-    if summaries:
-        report_lines.append("\n## 📋 Clinical Interpretation")
-        
-        if "impression" in summaries:
-            report_lines.append(f"**Impression/Diagnosis:**\n{summaries['impression']}")
+    impression = summaries.get("impression") or summaries.get("findings")
+    if impression:
+        clean_imp = clean_ads_and_noise(impression)
+        if clean_imp:
+            report_lines.append("CLINICAL IMPRESSION")
+            report_lines.append(clean_imp[:600])
+            report_lines.append("---")
+
+    # 2. Vital Indicators (Abnormal Labs)
+    abnormal_labs = processed_data.get("lab_abnormalities", [])
+    if abnormal_labs:
+        report_lines.append("VITAL INDICATORS (ABNORMAL)")
+        for lab in abnormal_labs:
+            name = lab.get("name", "Test")
+            val = lab.get("value", "")
+            unit = lab.get("unit", "")
+            status = lab.get("status", "")
+            why = lab.get("insight_why", "Clinically significant outlier.")
             
-        if "history" in summaries:
-            report_lines.append(f"\n**Context:**\n{summaries['history']}")
-            
-        if "findings" in summaries:
-            report_lines.append(f"\n**Detailed Findings:**\n{summaries['findings']}")
-            
-    # 4. Action Plan / Recommendations
+            # Cleaner bullet: [Test] - [Value] [Unit] ([Status])
+            report_lines.append(f"• {name}: {val} {unit} ({status}) — {why}")
+        report_lines.append("---")
+
+    # 3. Imaging & Measurements
+    if "findings" in summaries or "impression" in summaries:
+        text_block = (summaries.get("findings","") + " " + summaries.get("impression","")).lower()
+        sizes = re.findall(r"(\d+(?:\.\d+)?\s*[xX]\s*\d+(?:\.\d+)?(?:\s*[xX]\s*\d+(?:\.\d+)?)?\s*(?:cm|mm))", text_block)
+        if sizes:
+             report_lines.append("IMAGING / MEASUREMENTS")
+             for s in list(set(sizes)):
+                 report_lines.append(f"• Physical Finding: {s} — Clinical correlation advised.")
+             report_lines.append("---")
+
+    # 4. Next Steps & Recommendations
     recs = processed_data.get("recommendations", [])
     if recs:
-         report_lines.append("\n## ✅ Recommended Action Plan")
-         for rec in recs:
-             report_lines.append(f"- {rec}")
-    
-    return "\n".join(report_lines)
+        report_lines.append("NEXT STEPS & RECOMMENDATIONS")
+        for i, rec in enumerate(recs, 1):
+            advice = rec.get("advice", "") if isinstance(rec, dict) else rec
+            report_lines.append(f"{i}. {advice}")
+
+    final_text = "\n".join(report_lines).strip()
+    # Strip markdown bold per user preference
+    final_text = final_text.replace("**", "")
+    return final_text if final_text else "No clinical findings detected for summary."
 
 def analyze_full_report(current_text, previous_text=None):
     # 1. Run New Orchestrator
@@ -805,6 +923,63 @@ def analyze_full_report(current_text, previous_text=None):
 
     return result
 
+def simplify_text(text):
+    """Fallback manual simplification if LLM is unavailable."""
+    if not text: return ""
+    replacements = {
+        "hematology": "Blood Test",
+        "cardiology": "Heart Health",
+        "pathology": "Lab Results",
+        "radiology": "Imaging/Scans",
+        "acute": "Recent/Sudden",
+        "chronic": "Long-term",
+        "hypolipidemic": "Cholesterol-lowering",
+        "nephropathy": "Kidney issues"
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v).replace(k.title(), v)
+    return text
+
+def synthesize_patient_view(processed_data):
+    """
+    Constructs a clear, layman's summary and health status.
+    """
+    all_labs = processed_data.get("structured_labs", [])
+    # Only count actual medical alerts
+    abnormal_labs = [l for l in all_labs if l['status'] != "Normal"]
+    risks = processed_data.get("risks", [])
+    
+    # 1. Findings
+    if not abnormal_labs:
+        findings = "Your laboratory results are within the normal reference range. All tested indicators appear stable."
+    else:
+        top_labs = [f"**{l['name']}** ({l['status']})" for l in abnormal_labs[:3]]
+        findings = f"Your report identified {len(abnormal_labs)} indicators that are currently outside the standard range, including {', '.join(top_labs)}."
+
+    # 2. Health Status & Timeline
+    urgent_flags = [r for r in risks if r.get('level') == 'Severe']
+    
+    if len(abnormal_labs) == 0 and not urgent_flags:
+        impression = "Overall Health Status: **Excellent / Healthy**."
+        next_test = "Next routine health screening is recommended in **12 months**."
+    elif len(abnormal_labs) <= 2 and not urgent_flags:
+        impression = "Overall Health Status: **Good (with minor variations)**."
+        next_test = "Follow-up testing is advised in **6 months** to monitor these values."
+    else:
+        impression = "Overall Health Status: **Needs Clinical Correlation**."
+        next_test = "Please schedule a follow-up with your physician within **1-3 months** for a full evaluation."
+
+    full_impression = f"{impression}\n\nRecommendation: {next_test}"
+    
+    # Strip markdown bold per user preference
+    findings = findings.replace("**", "")
+    full_impression = full_impression.replace("**", "")
+    
+    return {
+        "findings": findings,
+        "impression": full_impression
+    }
+
 def explain_to_patient(text):
     """
     Uses LLM to generate a patient-friendly explanation.
@@ -835,9 +1010,98 @@ def detect_severity(text):
     elif any(x in text_lower for x in ["moderate", "elevated", "abnormal"]):
         return {"level": "Moderate", "color": "orange"}
     elif any(x in text_lower for x in ["mild", "trace", "minor", "borderline"]):
-         return {"level": "Mild", "color": "yellow"}
+        return {"level": "Mild", "color": "yellow"}
     
     return {"level": "Normal", "color": "green"}
+
+
+def parse_complex_value(val_str):
+    """
+    Converts strings like '220 x 10^3', '1.2E+03', '4.8 million', or '11.0 k/uL' into absolute floats.
+    """
+    if not val_str:
+        return 0.0
+    
+    # 0. Handle "Trends" or interleaved data
+    # If string contains multiple numbers separated by spaces, take the first one
+    # This prevents catching last year's results on the same line.
+    first_block = re.split(r"\s{2,}", val_str.strip())[0].strip()
+    
+    # 0.1 Handle numeric values preceded by '-' (common in change columns)
+    # We want to skip if it's JUST a change column, but usually the result is first.
+    
+    clean_val = first_block.replace(" ", "").lower()
+    
+    try:
+        # Multipliers (million, k, mili, billion)
+        multiplier = 1.0
+        if 'million' in clean_val or 'mili' in clean_val: multiplier = 1000000.0
+        elif 'billion' in clean_val: multiplier = 1000000000.0
+        elif 'k' in clean_val or '^3' in clean_val or ('x' in clean_val and '10^' not in clean_val):
+             multiplier = 1000.0
+
+        # 0.2 Handle standalone ^ multiplier (e.g. "6.261 ^3")
+        if '^' in clean_val:
+            caret_match = re.search(r"\^(\d+)", clean_val)
+            if caret_match:
+                exp = int(caret_match.group(1))
+                if '10^' not in clean_val:
+                    # Treat ^3 as 10^3 if no base is provided
+                    multiplier = 10 ** exp
+
+        # 1. Handle "220x10^3" or "5.5*10^3"
+        sci_match = re.search(r"(\d+(?:\.\d+)?)\s*[x\*]\s*10\^(\d+)", first_block, re.IGNORECASE)
+        if sci_match:
+            base = float(sci_match.group(1))
+            exp = int(sci_match.group(2))
+            return base * (10 ** exp) * multiplier
+            
+        # 2. Handle "1.2e+03"
+        if 'e' in clean_val and ('+' in clean_val or '-' in clean_val):
+            e_match = re.search(r"(\d+(?:\.\d+)?e[\+\-]?\d+)", clean_val)
+            if e_match:
+                return float(e_match.group(1)) * multiplier
+            
+        # 3. Standard extraction
+        # Allow < or > but strip for math
+        numeric_match = re.search(r"(\d+(?:\.\d+)?)", clean_val)
+        if numeric_match:
+            return float(numeric_match.group(1)) * multiplier
+            
+        return 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def is_significant_test(name, val_str=None):
+    """Filters out noise that looks like a lab test but isn't."""
+    if not name: return False
+    name_low = name.lower().strip()
+    
+    # Comprehensive Noise List for Institutional Reports
+    noise_words = [
+        "date", "collected", "reported", "page", "result", "reference", "ref", 
+        "range", "units", "status", "flag", "method", "specimen", "investigation",
+        "order", "visit", "patient", "customer", "referred", "barcode",
+        "sample type", "report status", "desirable", "borderline", "optimal", 
+        "technique", "prepared for", "basic info", "summary", "electronically",
+        "click here", "verified", "interpreted", "disclaimer", "pregnant",
+        "age", "gender", "sex", "name", "doctor", "history", "findings", "impression",
+        "high risk", "low risk", "desirable", "normal", "abnormal"
+    ]
+    
+    # 1. Exact matches or starters
+    if any(name_low == n or name_low.startswith(f"{n} ") or name_low.startswith(f"{n}:") for n in noise_words):
+        return False
+        
+    # 2. Pattern based (e.g. MGP791564 or 15338405)
+    if re.match(r"[a-zA-Z]{2,}\d{4,}", name_low) or re.match(r"^\d{5,}", name_low): # Mixed or long numeric ID
+        return False
+        
+    # 3. Validation
+    if len(name_low) < 2: return False
+    if not name_low[0].isalnum(): return False
+    
+    return True
 
 def extract_labs_regex(text):
     """
@@ -849,101 +1113,247 @@ def extract_labs_regex(text):
     
     # Pattern: Name: Value Unit? [Range?]
     # Groups: 1=Name, 2=Value, 3=Unit(Optional), 4=Range(Optional)
-    # Changed group 3 to optional (with ?) and added check logic
-    pattern = re.compile(
-        r"([A-Za-z0-9\s\(\)\-\.]+?)[:\s]+(\d+(?:\.\d+)?)\s*([a-zA-Z%\^/0-9]*)\s*(?:[\(\[]?(\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?|[<>]\s*\d+(?:\.\d+)?)[\)\]]?)?"
-    )
+    # Improved value part to capture keywords like million/k
+    # Improved value part to capture keywords like million/k and scaling signs (^, x)
+    V_VAL = r"(?:[<>≈]?\s*\d+(?:\.\d+)?(?:\s*[x\*]\s*10\^\d+|[eE][\+\-]?\d+|\s*[\^x\*]\s*\d+)?(?:\s*million|billion|k|mili)?)"
+    # Improved Range regex to capture units and multipliers (million, k/uL, etc.)
+    V_UNIT = r"(?:[<>≈]?\s*\d+(?:\.\d+)?(?:\s*[x\*]\s*10\^\d+|[eE][\+\-]?\d+)?(?:\s*[a-zA-Z%\^/0-9\*]+)?)"
+    RANGE_REGEX = r"(?:[\(\[]?(" + V_UNIT + r"\s*[-–]\s*" + V_UNIT + r"|[<>≈]\s*" + V_UNIT + r"|" + V_UNIT + r")[\)\]]?)"
+    
+    patterns = [
+        # 1. Standard: Name: Value Unit Range? (Requires Colon)
+        re.compile(r"([A-Za-z0-9 \t\(\)\-\.]{2,60}?):\s*(" + V_VAL + r")\s*([a-zA-Z%\^/0-9\*]*)\s*(?:" + RANGE_REGEX + ")?"),
+        
+        # 2. Tabular: Name (2+ spaces) Value (Flexible separator for institutional results)
+        re.compile(r"(?m)^\s*([A-Za-z][A-Za-z0-9 \(\)\-\.]{2,40}?)(?:\t|\s{2,})([<>≈]?\s*\d+(?:\.\d+)?(?:\s*million|billion|k|mili)?[\s\d\.\-–\%\^x\*]*)\s*([a-zA-Z%\^/0-9\*]*)\s*(?:" + RANGE_REGEX + ")?"),
+        
+        # 3. Anchor Hunt: Look for known tests even with single space (Institutional Fallback)
+        # Matches: "Hemoglobin 14.5 g/dL" or "RBC 4.8 million"
+        # We only do this for the top 50 most common labs to avoid noise.
+    ]
+    
+    # 4. Supplemental "Anchor Hunt" for critical labs (if they were missed by regex)
+    # We'll run this manually after the regex loop below.
     
     found_names = set()
 
-    for match in pattern.finditer(text):
-        raw_name = match.group(1).strip()
-        value = float(match.group(2))
-        unit = match.group(3).strip()
-        raw_range = match.group(4)
-        
-        if len(raw_name) < 2 or raw_name.lower() in ["page", "date", "dob", "specimen", "patient", "collected", "reported", "result", "investigation"]:
-            continue
+    for i, pattern in enumerate(patterns):
+        # Process in chunks to avoid regex hangs on huge files
+        chunk_size = 50000
+        for start_idx in range(0, len(text), chunk_size):
+            chunk = text[start_idx : start_idx + chunk_size + 500]
             
-        # Ad / Noise Filter
-        raw_lower = match.group(0).lower()
-        if any(x in raw_lower for x in ["discount", "package", "offer", "visit us", "www.", "iso", "nabl", "cap accredited", "technology", "powered by"]):
-            continue
-            
-        normalized = normalize_name(raw_name)
-        system_ref = REFERENCE_RANGES.get(normalized)
-        
-        # Unit Inference Logic
-        if not unit and system_ref:
-            # If unit missing but we know the test, infer it
-            unit = system_ref.get('unit', '')
-            
-        # Validation: If unit still invalid/missing and not in KB, skip
-        known_units = ["mg/dl", "g/dl", "u/l", "mmol/l", "%", "x10^3/ul", "fl", "pg", "iu/l", "ng/ml", "ug/dl", "ratio", "/ul", "cells/ul"]
-        if not system_ref and unit.lower() not in known_units:
-             # Last ditch: check if value is plausible for a known test (too risky? probably.)
-             continue
+            for match in pattern.finditer(chunk):
+                raw_name = ""
+                value = 0.0
+                unit = ""
+                raw_range = None
+                
+                # Check for 4 groups (Name, Val, Unit, Range)
+                if len(match.groups()) == 4:
+                    raw_name = match.group(1).strip()
+                    val_str = match.group(2).strip()
+                    value = parse_complex_value(val_str)
+                    unit = match.group(3).strip() if match.group(3) else ""
+                    raw_range = match.group(4)
+                else:
+                    # Legacy or 3-group match
+                    raw_name = match.group(1).strip()
+                    val_str = match.group(2).strip()
+                    value = parse_complex_value(val_str)
+                    unit = match.group(3).strip() if match.group(3) else ""
+                    raw_range = None
 
-        if normalized in found_names: continue
+                # Defensive: never accept multi-line names (usually a header + analyte merged)
+                if "\n" in raw_name or "\r" in raw_name:
+                    continue
 
-        status = "Normal"
-        ref_source = "Unknown"
-        ref_str = "N/A"
+                if not is_significant_test(raw_name):
+                    continue
+
+                # Ad / Noise Filter
+                raw_lower = match.group(0).lower()
+                if any(x in raw_lower for x in ["discount", "package", "offer", "visit us", "www.", "iso", "nabl", "cap accredited", "technology", "powered by"]):
+                    continue
+
+                normalized = normalize_name(raw_name)
+                system_ref = REFERENCE_RANGES.get(normalized)
+
+                # Unit Inference Logic
+                if not unit and system_ref:
+                    # If unit missing but we know the test, infer it
+                    unit = system_ref.get('unit', '')
+
+                # Validation: If unit still invalid/missing and not in KB, skip
+                known_units = ["mg/dl", "g/dl", "u/l", "mmol/l", "%", "x10^3/ul", "fl", "pg", "iu/l", "ng/ml", "ug/dl", "ratio", "/ul", "cells/ul"]
+                if not system_ref and unit.lower() not in known_units and not (unit == "" and value > 0):
+                    # Keep it looser now: if it looks like a test (Name + Value), keep it unless obviously junk.
+                    # Only skip if no unit AND no range AND name is suspicious?
+                    if len(raw_name.split()) > 6:
+                        continue  # Name too long, probably text
+
+                if normalized in found_names:
+                    continue
+
+                status = "Normal"
+                ref_source = "Unknown"
+                ref_str = "N/A"
+
+                # 1. Try Lab Provided Range (Primary)
+                lab_min = None
+                lab_max = None
+
+                if raw_range:
+                    try:
+                        # Handle "10 - 20"
+                        if "-" in raw_range or "–" in raw_range:
+                            parts = re.split(r"[-–]", raw_range)
+                            if len(parts) == 2:
+                                # Multiplier check for range (e.g. "4.1 - 5.9 million")
+                                # We apply the multiplier if found in either part or the whole string
+                                multiplier = 1.0
+                                if 'million' in raw_range.lower(): multiplier = 1000000.0
+                                elif 'billion' in raw_range.lower(): multiplier = 1000000000.0
+                                elif 'k' in raw_range.lower(): multiplier = 1000.0
+
+                                # parse_complex_value handles internal multipliers too.
+                                # But we handle the "range-wide" multiplier here.
+                                v_min = parse_complex_value(parts[0].strip())
+                                v_max = parse_complex_value(parts[1].strip())
+                                
+                                # Optimization: only apply multiplier if parse didn't already
+                                lab_min = v_min * (multiplier if v_min < 1000 and multiplier > 1 else 1.0)
+                                lab_max = v_max * (multiplier if v_max < 1000 and multiplier > 1 else 1.0)
+                                
+                                ref_str = raw_range
+                                ref_source = "Lab Report"
+                        # Handle "< 100" or "> 50"
+                        elif "<" in raw_range:
+                            val = parse_complex_value(raw_range.replace("<", "").strip())
+                            lab_max = val
+                            lab_min = 0 
+                            ref_str = raw_range
+                            ref_source = "Lab Report"
+                        elif ">" in raw_range:
+                            val = parse_complex_value(raw_range.replace(">", "").strip())
+                            lab_min = val
+                            lab_max = float('inf')
+                            ref_str = raw_range
+                            ref_source = "Lab Report"
+                    except Exception:
+                        pass  # parsing failed, fall back
+
+                # 2. Fallback to System Default (Secondary)
+                if ref_source == "Unknown" and system_ref:
+                    # --- SCALING FIX ---
+                    # If the system unit implies a multiplier but the value might be absolute, 
+                    # we must scale the reference values.
+                    sys_unit = system_ref.get('unit', '').lower()
+                    sys_mult = 1.0
+                    if 'million' in sys_unit: sys_mult = 1000000.0
+                    elif 'billion' in sys_unit: sys_mult = 1000000000.0
+                    elif sys_unit.startswith('k/'): sys_mult = 1000.0
+                    
+                    lab_min = system_ref['min'] * sys_mult
+                    lab_max = system_ref['max'] * sys_mult
+                    ref_str = f"{system_ref['min']} - {system_ref['max']} {system_ref['unit']}"
+                    ref_source = "System Default"
+
+                # 3. Calculate Status
+                if lab_min is not None and lab_max is not None:
+                    if value < lab_min:
+                        status = "Low"
+                    elif value > lab_max:
+                        status = "High"
+
+                labs.append({
+                    "name": raw_name,
+                    "normalized_name": normalized,
+                    "value": value,
+                    "unit": unit,
+                    "status": status,
+                    "reference": ref_str,
+                    "source": ref_source
+                })
+                found_names.add(normalized)
+                
+    # --- 4. ANCHOR HUNT (Institutional Fallback) ---
+    # Many reports (1mg/LabCorp) use single spaces in tabular data.
+    # We hunt for critical markers from our knowledge base.
+    crit_markers = list(REFERENCE_RANGES.keys()) + list(SYNONYMS.keys())
+    # Strip very short common words to avoid noise
+    crit_markers = [m for m in crit_markers if len(m) > 3]
+
+    for marker in crit_markers:
+        norm_marker = normalize_name(marker)
+        if norm_marker in found_names: continue
         
-        # 1. Try Lab Provided Range (Primary)
-        lab_min = None
-        lab_max = None
+        # Match: Marker + optional junk + [Value] + [Unit?] + [Range?]
+        # The range capture uses our V_UNIT logic
+        m_pat = rf"\b{re.escape(marker)}\b\s*([<>≈]?\s*\d+(?:\.\d+)?(?:\s*million|mili|k)?)\s*([a-zA-Z%\^/0-9\*]*)[\s\t]*({RANGE_REGEX})?"
+        match = re.search(m_pat, text, re.IGNORECASE)
         
-        if raw_range:
-            try:
-                # Handle "10 - 20"
-                if "-" in raw_range or "–" in raw_range:
-                    parts = re.split(r"[-–]", raw_range)
-                    if len(parts) == 2:
-                        lab_min = float(parts[0].strip())
-                        lab_max = float(parts[1].strip())
-                        ref_str = f"{lab_min} - {lab_max} {unit}"
-                        ref_source = "Lab Report"
-                # Handle "< 100" or "> 50"
-                elif "<" in raw_range:
-                     val = float(raw_range.replace("<", "").strip())
-                     lab_max = val
-                     lab_min = 0 # assumption for things like cholesterol
-                     ref_str = f"< {val} {unit}"
-                     ref_source = "Lab Report"
-                elif ">" in raw_range:
-                     val = float(raw_range.replace(">", "").strip())
-                     lab_min = val
-                     lab_max = float('inf')
-                     ref_str = f"> {val} {unit}"
-                     ref_source = "Lab Report"
-            except:
-                pass # parsing failed, fall back
-        
-        # 2. Fallback to System Default (Secondary)
-        if ref_source == "Unknown" and system_ref:
-            lab_min = system_ref['min']
-            lab_max = system_ref['max']
-            ref_str = f"{lab_min} - {lab_max} {system_ref['unit']}"
+        if match:
+            raw_name = marker
+            val_str = match.group(1).strip()
+            unit = match.group(2).strip()
+            raw_range = match.group(3)
+            
+            value = parse_complex_value(val_str)
+            if value == 0 and not val_str: continue # skip junk
+            
+            normalized = normalize_name(raw_name)
+            
+            status = "Normal"
+            ref_str = "N/A"
             ref_source = "System Default"
+            lab_min, lab_max = None, None
+
+            # 1. Try Captured Range
+            if raw_range:
+                try:
+                    if "-" in raw_range or "–" in raw_range:
+                         parts = re.split(r"[-–]", raw_range)
+                         v_min = parse_complex_value(parts[0].strip())
+                         v_max = parse_complex_value(parts[1].strip())
+                         
+                         multiplier = 1.0
+                         if 'million' in raw_range.lower() or 'mili' in raw_range.lower(): multiplier = 1000000.0
+                         elif 'k' in raw_range.lower(): multiplier = 1000.0
+                         
+                         lab_min = v_min * (multiplier if v_min < 1000 and multiplier > 1 else 1.0)
+                         lab_max = v_max * (multiplier if v_max < 1000 and multiplier > 1 else 1.0)
+                         ref_str = raw_range
+                         ref_source = "Lab Report"
+                except: pass
+
+            # 2. Fallback to System
+            if lab_min is None and norm_marker in REFERENCE_RANGES:
+                system_ref = REFERENCE_RANGES[norm_marker]
+                sys_unit = system_ref.get('unit', '').lower()
+                sys_mult = 1.0
+                if 'million' in sys_unit or 'mili' in sys_unit: sys_mult = 1000000.0
+                elif sys_unit.startswith('k/'): sys_mult = 1000.0
+                
+                lab_min = system_ref['min'] * sys_mult
+                lab_max = system_ref['max'] * sys_mult
+                ref_str = f"{system_ref['min']}-{system_ref['max']} {system_ref['unit']}"
+                if not unit: unit = system_ref.get('unit', '')
+
+            if lab_min is not None and lab_max is not None:
+                if value < lab_min: status = "Low"
+                elif value > lab_max: status = "High"
             
-        # 3. Calculate Status
-        if lab_min is not None and lab_max is not None:
-            if value < lab_min:
-                status = "Low"
-            elif value > lab_max:
-                status = "High"
-        
-        labs.append({
-            "name": raw_name,
-            "normalized_name": normalized,
-            "value": value,
-            "unit": unit,
-            "status": status,
-            "reference": ref_str,
-            "source": ref_source
-        })
-        found_names.add(normalized)
+            labs.append({
+                "name": raw_name.title(),
+                "normalized_name": normalized,
+                "value": value,
+                "unit": unit,
+                "status": status,
+                "reference": ref_str,
+                "source": ref_source
+            })
+            found_names.add(normalized)
         
     return labs
 
@@ -951,25 +1361,50 @@ def calculate_risk(labs):
     risks = []
     lab_map = {l['normalized_name']: l for l in labs}
     
-    # CV Risk
+    # 1. Cardiovascular Risk
     chol = lab_map.get('cholesterol')
     ldl = lab_map.get('ldl')
+    hdl = lab_map.get('hdl')
     if chol and chol['value'] > 240:
-        risks.append({"type": "Cardiovascular", "status": "High Risk", "detail": "Total Cholesterol > 240"})
+        risks.append({"type": "Cardiovascular", "status": "High Risk", "level": "Severe", "condition": "High Total Cholesterol", "detail": f"Cholesterol {chol['value']} mg/dL exceeds high risk threshold."})
     elif chol and chol['value'] > 200:
-        risks.append({"type": "Cardiovascular", "status": "Moderate Risk", "detail": "Total Cholesterol > 200"})
-    elif ldl and ldl['value'] > 160:
-        risks.append({"type": "Cardiovascular", "status": "High Risk", "detail": "LDL > 160"})
+        risks.append({"type": "Cardiovascular", "status": "Moderate Risk", "level": "Moderate", "condition": "Elevated Cholesterol", "detail": "Total Cholesterol > 200 mg/dL."})
+    if ldl and ldl['value'] > 160:
+        risks.append({"type": "Cardiovascular", "status": "High Risk", "level": "Severe", "condition": "High LDL", "detail": "Bad cholesterol (LDL) is significantly elevated."})
+    if hdl and hdl['value'] < 40:
+         risks.append({"type": "Cardiovascular", "status": "Elevated Risk", "level": "Moderate", "condition": "Low HDL", "detail": "Good cholesterol (HDL) is low."})
 
-    # Diabetes
+    # 2. Diabetes & Metabolic
     gluc = lab_map.get('glucose')
-    if gluc and gluc['value'] > 126:
-        risks.append({"type": "Diabetes", "status": "High Risk", "detail": "Fasting Glucose > 126"})
+    hba1c = lab_map.get('hba1c')
+    if hba1c:
+        if hba1c['value'] >= 6.5:
+            risks.append({"type": "Diabetes", "status": "Likely Diabetic", "level": "Severe", "condition": "Diabetes", "detail": f"HbA1c {hba1c['value']}% indicates diabetic range."})
+        elif hba1c['value'] >= 5.7:
+            risks.append({"type": "Diabetes", "status": "Prediabetic", "level": "Moderate", "condition": "Prediabetes", "detail": f"HbA1c {hba1c['value']}% indicates early insulin resistance."})
+    elif gluc and gluc['value'] > 126:
+        risks.append({"type": "Diabetes", "status": "High Risk", "level": "Severe", "condition": "Hyperglycemia", "detail": "Fasting Glucose > 126 mg/dL."})
         
-    # Kidney
+    # 3. Kidney Health
     creat = lab_map.get('creatinine')
     if creat and creat['value'] > 1.4:
-         risks.append({"type": "Kidney Health", "status": "Elevated Risk", "detail": "Creatinine High"})
+         risks.append({"type": "Kidney Health", "status": "Elevated Risk", "level": "Moderate", "condition": "Reduced Filtration", "detail": "Creatinine level suggests potential kidney stress."})
+
+    # 4. Inflammation
+    esr = lab_map.get('esr')
+    crp = lab_map.get('crp')
+    if (crp and crp['value'] > 10) or (esr and esr['value'] > 40):
+         risks.append({"type": "Inflammation", "status": "Systemic Stress", "level": "Moderate", "condition": "Inflammation", "detail": "Elevated inflammatory markers detected."})
+
+    # 5. Iron & Anemia
+    iron = lab_map.get('iron')
+    ferr = lab_map.get('ferritin')
+    hb = lab_map.get('hemoglobin')
+    if hb and hb['status'] == 'Low':
+        if (iron and iron['value'] < 50) or (ferr and ferr['value'] < 20):
+            risks.append({"type": "Hematology", "status": "Deficiency", "level": "Severe", "condition": "Iron Deficiency Anemia", "detail": "Low hemoglobin combined with low iron/ferritin stores."})
+        else:
+            risks.append({"type": "Hematology", "status": "Observation", "level": "Moderate", "condition": "Anemia", "detail": "Hemoglobin is below normal range."})
 
     return risks
 
@@ -1011,78 +1446,62 @@ def chunk_text(text, chunk_size=3000, overlap=200):
 def summarize_text(text):
     """
     Recursively summarizes long text (Map-Reduce style).
-    Optimized for Speed: Batched Inference + Density Sampling.
+    Optimized for Speed: High-Density Extract for medical reports.
     """
     model = get_summarizer()
     if not model: return "Summary unavailable."
     
-    # 1. If short enough, summarize directly
-    if len(text) < 3000:
+    # 1. Faster Threshold: Only summarize if > 1000 words
+    word_count = len(text.split())
+    if word_count < 300:
+        return text[:500] # Too short to summarize effectively
+        
+    # 2. Extract Key Sections (Faster than processing 19 pages of tables)
+    # We look for Impression/Findings/History which contain the "meat"
+    lines = text.split('\n')
+    key_lines = []
+    capture = False
+    for line in lines:
+        l_low = line.lower()
+        if any(k in l_low for k in ["impression", "findings", "history", "diagnosis", "conclusion"]):
+            capture = True
+        if capture and len(key_lines) < 200: # Limit focus
+            key_lines.append(line)
+        if len(line) > 100 and any(k in l_low for k in ["disclaimer", "performed at"]):
+            capture = False
+            
+    focused_text = "\n".join(key_lines) if key_lines else text[:10000]
+    
+    # 3. Direct Summary if manageable
+    if len(focused_text) < 4000:
         try:
-            summary = model(text[:3000], max_length=150, min_length=40, do_sample=False, truncation=True)
+            summary = model(focused_text, max_length=120, min_length=40, do_sample=False, truncation=True, batch_size=4)
             return summary[0]['summary_text']
         except Exception as e:
-            print(f"Summary Error (Short): {e}")
-            return "Summary generation failed."
+            print(f"Summary Error (Direct): {e}")
+            return focused_text[:300] + "..."
 
-    # 2. Long Document Strategy
-    print(f"Long text detected ({len(text)} chars). Chunking...")
+    # 4. Long Document Strategy (Density Sampling)
+    print(f"Long clinical text detected ({len(text)} chars). Using High-Density Extract.")
+    chunks = chunk_text(focused_text, chunk_size=3000, overlap=100)
     
-    # FAST MODE: If huge (> 50k chars), sample intelligently
-    if len(text) > 50000:
-        print("Enable FAST MODE: Density Sampling active.")
-        # We take first 15k (History/Context), last 10k (Impression), and sample middle
-        # This drastically reduces context for 100+ page reports while keeping key areas.
-        head = text[:15000]
-        tail = text[-10000:]
-        middle = text[15000:-10000]
-        
-        # Sample middle: take 5 chunks of 2000 chars evenly spaced
-        mid_chunks = []
-        if len(middle) > 10000:
-            step = len(middle) // 5
-            for i in range(0, len(middle), step):
-                mid_chunks.append(middle[i:i+2000])
-        else:
-            mid_chunks = [middle]
-            
-        text_to_process = head + "\n...\n" + "\n...\n".join(mid_chunks) + "\n...\n" + tail
-        chunks = chunk_text(text_to_process)
-    else:
-        chunks = chunk_text(text)
-
     chunk_summaries = []
-    
-    # BATCH processing (Speedup)
-    # Pipeline handles batching if we pass a List.
-    # Batch size 4 is safe for MPS/CPU usually.
+    # Speedup: Process with Batching
     BATCH_SIZE = 4 
-    
-    # Process in batches
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i : i + BATCH_SIZE]
         try:
-            # model(List[str]) returns List[dict]
-            results = model(batch, max_length=100, min_length=30, do_sample=False, truncation=True)
+            results = model(batch, max_length=80, min_length=20, do_sample=False, truncation=True, batch_size=len(batch))
             for res in results:
                 chunk_summaries.append(res['summary_text'])
-        except Exception as e:
-             print(f"Error summarizing batch {i}: {e}")
-             # Fallback: try one by one if batch fails
-             for chunk in batch:
-                 try:
-                     res = model(chunk, max_length=100, min_length=30, do_sample=False, truncation=True)
-                     chunk_summaries.append(res[0]['summary_text'])
-                 except: continue
+        except: continue
 
-    # 3. Final Summary of Summaries
-    combined_summary_text = " ".join(chunk_summaries)
+    combined = " ".join(chunk_summaries)
     try:
-         final_summary = model(combined_summary_text[:3000], max_length=200, min_length=50, do_sample=False, truncation=True)
-         return final_summary[0]['summary_text']
-    except Exception as e:
-        print(f"Summary Error (Final): {e}")
-        return combined_summary_text[:500] + "..."
+         final = model(combined[:3500], max_length=150, min_length=50, do_sample=False, truncation=True)
+         return final[0]['summary_text']
+    except:
+         return combined[:500] + "..."
 
 def get_follow_up_tests(labs, risks):
     tests = []
@@ -1304,13 +1723,16 @@ def analyze_radiology(text, sections):
     return {
         "modality": "Unknown Imaging", # Could extract "MRI of Brain" here later
         "abnormalities": abnormalities,
-        "is_normal": len(abnormalities) == 0
+        "is_normal": len(abnormalities) == 0,
+        "sizes": [] # Could be extracted if analyze_radiology was called on text with sizes
     }
 
 
-def get_recommended_specialists(risks, report_type="Lab"):
+    return list(specialists)
+
+def get_recommended_specialists(risks, report_type="Lab", location=None):
     """
-    Maps risks/abnormalities to medical specialists.
+    Maps risks/abnormalities to medical specialists with Location Search Link.
     """
     specialists = set()
     
@@ -1330,121 +1752,240 @@ def get_recommended_specialists(risks, report_type="Lab"):
         elif "liver" in r_type or "hepatitis" in detail:
             specialists.add("Hepatologist")
             
-    # 2. Logic based on Radiology Findings
-    if report_type == "Radiology":
-        # Broad mapping based on likely body parts (basic heuristic)
-        # In a real app, we'd check if "Brain MRI" -> Neurologist
-        pass 
-        
     # Default fallbacks
     if not specialists:
         if report_type == "Radiology":
-             specialists.add("Orthopedist") # skeletal stuff
-             specialists.add("Radiologist") # for consult
+            specialists.add("Orthopedist")
+            specialists.add("Radiologist")
         else:
-             specialists.add("Primary Care Physician")
-             
-    return list(specialists)
+            specialists.add("General Physician")
 
-def analyze_full_report(current_text, previous_text=None):
-    # 1. Structural Parsing (Common for both)
-    sections = extract_sections(current_text)
+    # Step 2: Use ThreadPoolExecutor to fetch specialist details in parallel
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Create a map of role to future object
+        # Each specialist role search is run in a separate thread
+        future_to_role = {executor.submit(fetch_specialist_data, role, location): role for role in specialists}
+        
+        for future in concurrent.futures.as_completed(future_to_role):
+            role = future_to_role[future]
+            try:
+                data = future.result()
+                results.append(data)
+            except Exception as exc:
+                print(f"Parallel Search Error for {role}: {exc}")
+                # Fallback for failed threads
+                results.append({
+                    "role": role,
+                    "link": f"https://www.google.com/maps/search/{role}+doctor".replace(' ', '+'),
+                    "profiles": []
+                })
+
+    return results
+
+def fetch_specialist_data(role, location):
+    """Helper to fetch all data for a single specialist role (Optimized for Threading)."""
+    loc_display = location if location else "your area"
     
-    # 2. Detect Type
-    report_type = detect_report_type(current_text)
+    # 1. Generate Map Link
+    query = f"{role} near {loc_display}"
+    map_link = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
     
-    # 3. Summary (Common)
-    summary = summarize_text(current_text)
+    # 2. Fetch Real Profiles (This hits APIs, slow part)
+    real_profiles = fetch_real_doctors(role, loc_display)
     
-    # 4. Entities (Common)
-    nlp_model = get_nlp()
-    if nlp_model:
-        doc = nlp_model(current_text)
-        entities = [{"text": e.text, "label": "ENTITY"} for e in doc.ents]
-    else:
-        entities = []
-    entities = [dict(t) for t in {tuple(d.items()) for d in entities}]
-    
-    result = {
-        "report_type": report_type,
-        "summary": summary,
-        "sections": sections,
-        "entities": entities
+    return {
+        "role": role,
+        "link": map_link,
+        "profiles": real_profiles
     }
 
-    if report_type == "Radiology":
-        rad_analysis = analyze_radiology(current_text, sections)
+def fetch_real_doctors(role, location):
+    """
+    Orchestrates fetching real doctor profiles from multiple sources.
+    Prioritizes structured data (Overpass) for speed.
+    """
+    try:
+        # Step 1: Try Overpass API (Community Driven / OpenStreetMap)
+        # Fast & no API key required.
+        doctors = fetch_overpass_doctors(role, location)
+        if doctors: return doctors
+    except:
+        pass
         
-        # Patient Explanation for Radiology
-        patient_impression = explain_to_patient(sections['impression'])
-        
-        # Calculate Specialists for Radiology (Basic)
-        # If fracture -> Orthopedist
-        specialists = ["Primary Care Physician"]
-        for ab in rad_analysis.get('abnormalities', []):
-            if "fracture" in ab.lower() or "bone" in ab.lower():
-                 specialists.append("Orthopedist")
-            if "tumor" in ab.lower() or "mass" in ab.lower():
-                 specialists.append("Oncologist")
-        specialists = list(set(specialists))
+    # Fallback to empty if both fail
+    return []
 
-        result.update({
-            "radiology": rad_analysis,
-            "patient_view": {
-                "findings": "See imaging details below.",
-                "impression": patient_impression,
-                "explanation": "Imaging reports describe visual findings. We've highlighted key abnormalities."
-            },
-            "risks": [], 
-            "labs": [], 
-            "recommendations": [],
-            "follow_up_tests": [],
-            "specialists": specialists 
-        })
+
+def geocode_locale(locale):
+    """Converts city/area name to lat,lon using Nominatim (Fast Timeout)."""
+    if not locale or locale == "your area":
+        return 18.5204, 73.8567 # Default to Pune, India coordinates as fallback
+    
+    try:
+        url = f"https://nominatim.openstreetmap.org/search?q={locale}&format=json&limit=1"
+        headers = {'User-Agent': 'MedicalReportAssistant/1.0'}
+        # REDUCED TIMEOUT for speed
+        resp = requests.get(url, headers=headers, timeout=3)
+        data = resp.json()
+        if data:
+            return float(data[0]['lat']), float(data[0]['lon'])
+    except Exception as e:
+        print(f"Geocoding Error: {e}")
+    return 18.5204, 73.8567
+
+def fetch_overpass_doctors(role, locale):
+    """Finds doctors nearby using Overpass API (Fast Timeout)."""
+    lat, lon = geocode_locale(locale)
+    
+    # Mapping common roles to OSM speciality tags
+    osm_specialities = {
+        "Cardiologist": "cardiology",
+        "Endocrinologist": "endocrinology",
+        "Nephrologist": "nephrology",
+        "Hematologist": "hematology",
+        "Hepatologist": "hepatology",
+        "Orthopedist": "orthopaedics",
+        "Radiologist": "radiology",
+        "General Physician": "general_practice"
+    }
+    spec = osm_specialities.get(role, "")
+    
+    # Build Query (Around 5km for speed)
+    spec_filter = f'["healthcare:speciality"="{spec}"]' if spec else ""
+    query = f"""
+    [out:json];
+    (
+      node["amenity"="doctor"]{spec_filter}(around:5000,{lat},{lon});
+      node["healthcare"="doctor"]{spec_filter}(around:5000,{lat},{lon});
+    );
+    out;
+    """
+    
+    try:
+        url = "https://overpass-api.de/api/interpreter"
+        # 4s timeout for Overpass vs old 10s
+        resp = requests.post(url, data={'data': query}, timeout=4)
+        data = resp.json()
         
-        if rad_analysis['abnormalities']:
-            result['risks'].append({"type": "Imaging Finding", "status": "Observation", "detail": "Abnormalities detected in scan."})
+        doctors = []
+        for element in data.get('elements', [])[:3]:
+            tags = element.get('tags', {})
+            name = tags.get('name', f"Medical Center ({role})")
+            addr = tags.get('addr:street', tags.get('addr:full', 'Nearby Medical Facility'))
+            doctors.append({
+                "name": name,
+                "rating": "Community Verified",
+                "reviews": addr,
+                "image": f"https://ui-avatars.com/api/?name={name.replace(' ','+')}&background=random",
+                "link": f"https://www.openstreetmap.org/node/{element['id']}"
+            })
+        if doctors: return doctors
+    except: pass
+    return []
+
+def enrich_abnormalities(labs):
+    """
+    Generates structured AI insights for abnormal values using LLM or Rule Base.
+    """
+    explainer = get_explainer() # flan-t5-small
+    
+    for lab in labs:
+        if lab['status'] == "Normal":
+            continue
             
-    else:
-        # Standard Lab Analysis
-        labs = extract_labs_regex(current_text)
-        risks = calculate_risk(labs)
-        recommendations = generate_recommendations(labs, risks)
-        follow_up_tests = get_follow_up_tests(labs, risks)
+        # Context for AI
+        name = lab['name']
+        val = lab['value']
+        status = lab['status']
         
-        # V16: Specialist Mapping
-        specialists = get_recommended_specialists(risks, "Lab")
+        # We can use the LLM to generate these fields, or a smart dictionary for speed/accuracy.
+        # Given latency concerns, let's use a Hybrid Template + LLM fill.
         
-        patient_findings = explain_to_patient(sections['findings'])
-        patient_impression = explain_to_patient(sections['impression'])
+        # 1. WHAT
+        lab['insight_what'] = f"{name} is {status} ({val})."
         
-        severity = {
-            "findings": detect_severity(sections['findings']),
-            "impression": detect_severity(sections['impression'])
+        # 2. WHY (Simplified Terms)
+        # Expanded Layman Dictionary
+        LAY_TERMS = {
+            "hemoglobin": "Red blood cell protein that carries oxygen.",
+            "glucose": "Blood sugar level.",
+            "cholesterol": "Fat-like substance in blood.",
+            "hba1c": "Average blood sugar over past 3 months.",
+            "creatinine": "Waste product filtered by kidneys.",
+            "tsh": "Hormone controlling thyroid energy.",
+            "wbc count": "Immune cells fighting infection.",
+            "platelets": "Cells that help blood clot.",
+            "alt": "Liver enzyme indicating health.",
+            "ast": "Liver enzyme indicating health.",
+            "triglycerides": "Type of fat in the blood.",
+            "sodium": "Electrolyte balancing water levels.",
+            "potassium": "Electrolyte vital for heart function.",
+            "calcium": "Mineral for bone strength.",
+            "vitamin d": "Vitamin for bones and immunity.",
+            "ferritin": "Stored iron levels.",
+            "uric acid": "Waste product linked to gout.",
+            "esr": "Inflammation marker.",
+            "crp": "Inflammation marker."
         }
         
-        comparison = {}
-        if previous_text:
-            prev_labs = extract_labs_regex(previous_text)
-            labs = compare_labs(labs, prev_labs)
-            comparison = {
-                "previous_labs": prev_labs,
-                "diff_summary": f"Compared against previous report." 
-            }
-            
-        result.update({
-            "patient_view": {
-                "findings": patient_findings,
-                "impression": patient_impression,
-                "explanation": "Simplified medical terms are shown in parentheses."
-            },
-            "severity": severity,
-            "labs": labs,
-            "risks": risks,
-            "recommendations": recommendations,
-            "follow_up_tests": follow_up_tests,
-            "comparison": comparison,
-            "specialists": specialists
-        })
+        norm_name = normalize_name(name)
+        simple_name = LAY_TERMS.get(norm_name, name)
+        
+        # Smart Insight based on Status (Focus on clinical meaning, avoid redundant text)
+        if status == "High":
+            if "glucose" in norm_name: reason = "Elevated sugar level; indicates risk of diabetes."
+            elif "cholesterol" in norm_name: reason = "High cholesterol level; linked to cardiovascular risk."
+            elif "creatinine" in norm_name: reason = "Elevated waste product; kidneys may require evaluation."
+            elif "wbc" in norm_name: reason = "High white cell count; suggests underlying infection/inflammation."
+            elif "lymphocytes" in norm_name: reason = "Elevated count; often seen in viral infections."
+            elif "eosinophils" in norm_name: reason = "High count; common in allergic reactions or parasitic issues."
+            elif "glycosylated" in norm_name or "hba1c" in norm_name: reason = "Indicator of elevated long-term blood sugar levels."
+            else: reason = f"Value is higher than standard clinical range."
+        elif status == "Low":
+            if "hemoglobin" in norm_name: reason = "Decreased red blood cell protein; indicator for anemia."
+            elif "vitamin" in norm_name: reason = "Clinical deficiency detected."
+            elif "platelets" in norm_name: reason = "Low platelet count; increased risk of easy bruising/bleeding."
+            elif "neutrophils" in norm_name: reason = "Decreased count; potential reduction in infection-fighting ability."
+            elif "rbc" in norm_name: reason = "Low red blood cell count; often linked to anemia or nutritional gaps."
+            else: reason = f"Value is lower than standard clinical range."
+        else:
+            reason = f"Abnormal level detected for {simple_name}."
 
-    return result
+        lab['insight_why'] = reason
+        
+        # 3. ACTION
+        lab['insight_action'] = "Consult doctor."
+        if status == "High" and "glucose" in norm_name: lab['insight_action'] = "Limit sugar/carbs."
+        if status == "High" and "cholesterol" in norm_name: lab['insight_action'] = "Low-fat diet & exercise."
+        if status == "Low" and "hemoglobin" in norm_name: lab['insight_action'] = "Iron-rich foods."
+        
+        # 4. MONITOR
+        lab['insight_monitor'] = "Retest in 3 months."
+        
+        # 5. NEXT TESTS
+        lab['insight_next_steps'] = "Standard panel follow-up."
+        
+    return labs
+
+def analyze_full_report(current_text, previous_text=None, location=None):
+    """
+    Main entry point for report analysis.
+    Delegates to the production-grade 'process_clinical_document' orchestrator.
+    """
+    print("Analyze Request Received. Delegating to Clinical Orchestrator.")
+    try:
+        return process_clinical_document(current_text, previous_text, user_location=location)
+    except Exception as e:
+        print(f"Orchestrator Error: {e}")
+        return {
+            "report_type": "Error",
+            "summary": f"An error occurred: {str(e)}",
+            "sections": {},
+            "entities": [],
+            "risks": [],
+            "labs": [],
+            "demographics": {},
+            "vitals": [],
+            "medications": []
+        }

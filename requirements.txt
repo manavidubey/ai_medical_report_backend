@@ -24,3 +24,5 @@ paddlepaddle
 paddleocr
 pymupdf
 opencv-python-headless
+googlemaps
+requests
