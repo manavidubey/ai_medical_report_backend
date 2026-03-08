@@ -4,6 +4,8 @@ from fastapi.responses import JSONResponse, FileResponse
 from typing import List, Optional
 import shutil
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import io
 import json
 import pdfplumber
@@ -25,6 +27,9 @@ origins = [
     "http://localhost:3000",
     "http://localhost:5173",
     "http://localhost:8000",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8000",
     "https://ai-medical-report-frontend-bay.vercel.app",
     "https://ai-medical-report-backend.vercel.app",
     "https://ai-medical-report-backend-fctm.vercel.app"
