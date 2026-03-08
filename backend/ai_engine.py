@@ -6,8 +6,7 @@ import io
 import requests
 import concurrent.futures
 import statistics
-from PIL import Image
-import spacy
+# from PIL import Image # Removed unused imports to save memory/prevent errors if not installed
 # Global Model Variables (Lazy Loaded) - Local ML Removed for Vercel
 openai_client = None
 

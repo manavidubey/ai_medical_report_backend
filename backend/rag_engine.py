@@ -1,65 +1,21 @@
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
+import os
+import json
 
 class MedicalAgent:
     """
-    Agentic AI that uses a ReAct (Reason+Act) loop to solve complex medical queries.
-    Tools: Report Search, Reference Lookup, Severity Check.
+    Agentic AI that uses OpenAI to solve medical queries.
+    Replaced local FAISS/Transformers with OpenAI for Vercel/Lightweight local run.
     """
     def __init__(self):
-        print("Initializing Medical Agent & RAG Memory...")
-        self.encoder = None
-        self.generator = None
-        self.index = None
-        self.chunks = []
+        self.report_text = ""
         
-    def load_models(self):
-        if self.encoder is None:
-            print("Loading Agent Encoder...")
-            self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-            
-        if self.generator is None:
-            print("Loading Agent Brain (Flan-T5)...")
-            # Upgrade to 'base' for better reasoning (Small is too weak)
-            self.generator = pipeline("text2text-generation", model="google/flan-t5-base")
-
     def ingest_report(self, text):
-        self.load_models()
-        self.chunks = [c.strip() for c in text.split('\n\n') if c.strip()]
-        
-        # Optimize chunk size
-        final_chunks = []
-        for c in self.chunks:
-            if len(c.split()) > 200:
-                subs = c.split('. ')
-                final_chunks.extend(subs)
-            else:
-                final_chunks.append(c)
-        self.chunks = final_chunks
-        
-        if not self.chunks: return
-        
-        embeddings = self.encoder.encode(self.chunks)
-        dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(np.array(embeddings).astype('float32'))
-        print(f"Agent Memory Updated: {len(self.chunks)} facts indexed.")
-
-    # --- TOOLS ---
-    def search_report(self, query):
-        """Tool: Search the patient's report for specific info."""
-        if not self.index: return "No report loaded."
-        q_emb = self.encoder.encode([query])
-        D, I = self.index.search(np.array(q_emb).astype('float32'), k=3)
-        results = [self.chunks[i] for i in I[0] if i < len(self.chunks)]
-        return "\n".join(results)
+        """Stores the report text for context."""
+        self.report_text = text
+        print(f"Agent Memory Updated: Report ingested.")
 
     def check_guidelines(self, query):
-        """Tool: Check general medical guidelines (Simulated Knowledge Base)."""
-        # In a real LangChain app, this would query an external vector DB.
-        # Here we use heuristic knowledge.
+        """Heuristic knowledge tool."""
         q_lower = query.lower()
         if "diabetes" in q_lower or "glucose" in q_lower:
             return "Guideline: Normal Fasting Glucose is 70-99 mg/dL. >126 implies Diabetes."
@@ -69,47 +25,53 @@ class MedicalAgent:
             return "Guideline: Body temp > 100.4F (38C) is considered fever."
         return "No specific guideline found in local KB."
 
-    # --- AGENT BRAIN (ReAct Loop) ---
     def answer_question(self, question):
-        self.load_models()
+        """Uses OpenAI with report context to answer questions."""
+        from ai_engine import get_openai_client
+        client = get_openai_client()
         
-        # 1. Thought Step: Simple routing (Zero-Shot Classification heuristic)
-        # We classify if we need to search the report or answer generally.
-        tool_to_use = "search_report"
-        if "normal" in question.lower() or "range" in question.lower() or "standard" in question.lower():
-            tool_to_use = "check_guidelines"
+        if not client:
+            return {"answer": "AI service unavailable (Check OpenAI API Key).", "sources": []}
+
+        try:
+            # Combine context
+            context = self.report_text[:12000] # Limit context size
             
-        print(f"Agent Thought: User asks '{question}'. Using Tool: [{tool_to_use}]")
-        
-        # 2. Action Step
-        context = ""
-        if tool_to_use == "search_report":
-            context = self.search_report(question)
-        elif tool_to_use == "check_guidelines":
-            context = self.check_guidelines(question)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful medical assistant. Use the provided report context to answer the user's question accurately. If the answer isn't in the report, use your general medical knowledge but specify it's general info."},
+                    {"role": "user", "content": f"Context: {context}\n\nQuestion: {question}"}
+                ],
+                max_tokens=300,
+            )
             
-        # 3. Observation & Synthesis
-        # Combine context with a specific prompt
-        prompt = (
-            f"Context: {context}\n\n"
-            f"Question: {question}\n\n"
-            f"Answer the question using the context:"
-        )
-        
-        output = self.generator(prompt, max_length=200, do_sample=False)
-        return {
-            "answer": output[0]['generated_text'],
-            "sources": [context[:100] + "..."] if context else []
-        }
+            answer = response.choices[0].message.content
+            return {
+                "answer": answer,
+                "sources": ["Current Medical Report"] if self.report_text else []
+            }
+        except Exception as e:
+            print(f"Agent Error: {e}")
+            return {"answer": f"Error generating answer: {str(e)}", "sources": []}
 
     def generate_doctor_questions(self):
-        if not self.chunks: return "Please upload a report first."
-        self.load_models()
-        context = " ".join(self.chunks[:5])
-        prompt = (
-            f"List 3 questions to ask a doctor based on this report.\n"
-            f"Context: {context}\n"
-            f"Questions:"
-        )
-        output = self.generator(prompt, max_length=150, do_sample=True)
-        return output[0]['generated_text']
+        """Generates follow-up questions for a clinician."""
+        from ai_engine import get_openai_client
+        client = get_openai_client()
+        
+        if not client or not self.report_text:
+            return "Unable to generate questions at this time."
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Generate 3 professional questions a patient should ask their doctor based on this report."},
+                    {"role": "user", "content": f"Report Content: {self.report_text[:8000]}"}
+                ],
+                max_tokens=200,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Error: {str(e)}"
