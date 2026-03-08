@@ -26,6 +26,7 @@ origins = [
     "http://localhost:5173",
     "http://localhost:8000",
     "https://ai-medical-report-frontend-bay.vercel.app",
+    "https://ai-medical-report-backend.vercel.app",
     "https://ai-medical-report-backend-fctm.vercel.app"
 ]
 
