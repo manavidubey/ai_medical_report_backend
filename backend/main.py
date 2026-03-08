@@ -20,10 +20,18 @@ from pdf_processor import process_pdf
 
 app = FastAPI()
 
-# CORS logic
+# Production CORS configuration
+origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8000",
+    "https://ai-medical-report-frontend-bay.vercel.app",
+    "https://ai-medical-report-backend-fctm.vercel.app"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

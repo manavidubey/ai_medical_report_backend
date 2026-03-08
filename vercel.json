@@ -22,6 +22,10 @@
             "dest": "backend/main.py"
         },
         {
+            "src": "/(analyze|chat|timeline|generate-pdf|generate-questions|generate-referral)",
+            "dest": "backend/main.py"
+        },
+        {
             "src": "/(.*)",
             "dest": "frontend/$1",
             "check": true
