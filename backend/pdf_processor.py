@@ -167,63 +167,10 @@ def extract_text_with_layout(file_bytes):
     stitcher = DocumentStitcher()
     return stitcher.stitch(pages_text)
 
-def extract_text_with_ocr(file_bytes):
-    """
-    Converts PDF pages to images and runs PaddleOCR.
-    Best for scanned reports or images wrapped in PDF.
-    """
-    pages_text = []
-    ocr = get_ocr_model()
-    
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            
-            # Render page to image (300 DPI = zoom_x=4, zoom_y=4 roughly)
-            mat = fitz.Matrix(2, 2) 
-            pix = page.get_pixmap(matrix=mat)
-            
-            # Convert to numpy array (RGB)
-            img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-            if pix.n == 4: # RGBA
-                img_data = cv2.cvtColor(img_data, cv2.COLOR_RGBA2RGB)
-            
-            # Run OCR
-            if ocr:
-                result = ocr.ocr(img_data, cls=True)
-                if not result or result[0] is None:
-                    pages_text.append("")
-                    continue
-                    
-                # Sort boxes by Y-coordinate primarily (rows), then X-coordinate (columns)
-                # This is critical for medical tables
-                # PaddleOCR result: [ [ [[x1,y1]..], (text, conf) ], ... ]
-                lines_data = sorted(result[0], key=lambda x: x[0][0][1]) # Check Y1 of box
-                
-                txts = [line[1][0] for line in lines_data]
-                page_text = "\n".join(txts)
-                pages_text.append(page_text)
-            else:
-                 pages_text.append("[OCR Failed - No Model]")
-            
-    except Exception as e:
-        print(f"OCR Extraction Error: {e}")
-    
-    # Stitch pages
-    stitcher = DocumentStitcher()
-    return stitcher.stitch(pages_text)
-
 def process_pdf(file_bytes):
     """
-    Main entry point. Automatically routes to best extraction method.
+    Main entry point. Optimized for Vercel (Text extraction only).
+    OCR is disabled to keep the bundle size under 500MB.
     """
-    pdf_type = detect_pdf_type(file_bytes)
-    
-    if pdf_type == "text_pdf":
-        print("Using Layout Extraction (pdfplumber)...")
-        return extract_text_with_layout(file_bytes)
-    else:
-        print("Using OCR Extraction (PaddleOCR)...")
-        return extract_text_with_ocr(file_bytes)
+    print("Using Layout Extraction (pdfplumber)...")
+    return extract_text_with_layout(file_bytes)

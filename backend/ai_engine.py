@@ -8,189 +8,81 @@ import concurrent.futures
 import statistics
 from PIL import Image
 import spacy
-from transformers import pipeline
-from deepdiff import DeepDiff
-try:
-    from duckduckgo_search import DDGS
-    HAS_DDG = True
-except ImportError:
-    HAS_DDG = False
-    print("DuckDuckGo Search not installed. Using mock data.")
+# Global Model Variables (Lazy Loaded) - Local ML Removed for Vercel
+openai_client = None
 
-try:
-    import googlemaps
-    HAS_GOOGLE_MAPS = True
-except ImportError:
-    HAS_GOOGLE_MAPS = False
-
-# Global Model Variables (Lazy Loaded)
-summarizer = None
-explainer = None
-nlp = None
-llama_model = None
-llama_processor = None
-clip_classifier = None
+def get_openai_client():
+    global openai_client
+    if openai_client is None:
+        try:
+            from openai import OpenAI
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                print("Warning: OPENAI_API_KEY not found in environment.")
+            openai_client = OpenAI(api_key=api_key)
+        except Exception as e:
+            print(f"Error initializing OpenAI client: {e}")
+    return openai_client
 
 def get_summarizer():
-    global summarizer
-    if summarizer is None:
-        print("Loading Summarization Model...")
-        try:
-            summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-        except Exception as e:
-            print(f"Error loading summarizer: {e}")
-            return None
-    return summarizer
+    # Local summarizer removed. Using OpenAI in summarize_text function.
+    return "openai"
 
 def get_explainer():
-    global explainer
-    if explainer is None:
-        print("Loading Explainer Model...")
-        try:
-            explainer = pipeline("text2text-generation", model="google/flan-t5-small")
-        except Exception as e:
-            print(f"Warning: Could not load explainer model: {e}")
-            explainer = None
-    return explainer
+    # Local explainer removed. Using OpenAI in explain_to_patient function.
+    return "openai"
 
 def get_nlp():
-    global nlp
-    if nlp is None:
-        print("Loading Scispacy Medical Model...")
-        try:
-            # Use the installed small scientific model
-            nlp = spacy.load("en_core_sci_sm")
-        except OSError:
-            print("Warning: en_core_sci_sm not found, falling back to en_core_web_sm. Please install the model.")
-            try:
-                nlp = spacy.load("en_core_web_sm")
-            except:
-                try:
-                    from spacy.cli import download
-                    download("en_core_web_sm")
-                    nlp = spacy.load("en_core_web_sm")
-                except Exception as e:
-                    print(f"Error loading SpaCy: {e}")
-    return nlp
+    # Spacy removed for Vercel. Falling back to regex-based parsing.
+    return None
 
 def get_vision_models():
-    """
-    Lazy loads vision models. returns (llama_model, llama_processor, clip_classifier)
-    """
-    global llama_model, llama_processor, clip_classifier
-    
-    if llama_model is None and clip_classifier is None:
-        print("Loading Visual AI Models...")
-
-        # A. Try Loading Llama 3.2 Vision (11B)
-        # This requires HF_TOKEN and significant RAM (>20GB) or VRAM.
-        # Disabled by default for Render Free Tier / Standard deployments to prevent timeouts
-        load_llama = False 
-        
-        if load_llama:
-            try:
-                model_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-                print(f"Attempting to load {model_id}...")
-                
-                # Use device_map="auto" to offload to standard RAM if GPU/MPS is full
-                # torch_dtype=torch.bfloat16 is standard for Llama 3 on recent hardware
-                llama_model = MllamaForConditionalGeneration.from_pretrained(
-                    model_id,
-                    torch_dtype=torch.bfloat16,
-                    device_map="auto",
-                )
-                llama_processor = AutoProcessor.from_pretrained(model_id)
-                print("SUCCESS: Llama 3.2 Vision Loaded!")
-                
-            except Exception as e:
-                print(f"Llama 3.2 Load Failed (Falling back to CLIP): {e}")
-                # Common reasons: No HF_TOKEN, OOM, or model access not granted.
-
-        # B. Load CLIP (Zero-Shot) - Always load as fallback or primary if Llama fails
-        try:
-            clip_classifier = pipeline("zero-shot-image-classification", model="openai/clip-vit-base-patch32")
-            if not llama_model:
-                print("Using CLIP as Primary Vision Model.")
-        except Exception as e:
-            print(f"Warning: Could not load CLIP model: {e}")
-            
-    return llama_model, llama_processor, clip_classifier
+    # Local vision removed. Using OpenAI Vision in analyze_medical_image.
+    return None, None, "openai"
 
 
 def analyze_medical_image(image_bytes):
     """
-    Analyzes an X-Ray/MRI image using Llama 3.2 (if avail) or CLIP.
+    Analyzes an X-Ray/MRI image using OpenAI Vision API.
     """
-    # 1. Try Llama 3.2 Vision (Deep Analysis)
-    llama_model, llama_processor, clip_classifier = get_vision_models()
-    
-    if llama_model and llama_processor:
-        try:
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            
-            # Simple Medical Prompt
-            prompt = "<|image|><|begin_of_text|>Analyze this medical image. Describe findings and impression."
-            inputs = llama_processor(image, prompt, return_tensors="pt").to(llama_model.device)
-            
-            output = llama_model.generate(**inputs, max_new_tokens=150)
-            description = llama_processor.decode(output[0])
-            
-            # Cleanup output (remove prompt parts)
-            description = description.replace(prompt, "").replace("<|begin_of_text|>", "").strip()
-            
-            return {
-                "modality": "Medical Imaging (Llama 3.2 Analysis)",
-                "predictions": [{"label": "Detailed Analysis", "confidence": 100}],
-                "finding": description,
-                "note": "Generated by Llama 3.2 Vision (11B). Validate clinically."
-            }
-        except Exception as e:
-            print(f"Llama Inference Failed: {e}. Falling back to CLIP.")
-            # Fallthrough to CLIP
+    client = get_openai_client()
+    if not client:
+        return {"error": "OpenAI client not initialized (API Key missing?)"}
 
-    # 2. Fallback: CLIP (Modality Detection)
-    if clip_classifier:
-        try:
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            
-            candidate_labels = [
-                "chest x-ray", "brain mri", "abdominal ct scan", 
-                "fetal ultrasound", "bone fracture", "medical document",
-                "random noise", "random object"
-            ]
-            
-            predictions = clip_classifier(image, candidate_labels=candidate_labels)
-            
-            formatted_preds = []
-            is_medical_image = False
-            top_label = predictions[0]['label']
-            top_score = predictions[0]['score'] * 100
-            
-            for p in predictions[:3]:
-                label = p['label']
-                score = round(p['score'] * 100, 1)
-                
-                if any(x in label for x in ['x-ray', 'mri', 'ct scan', 'ultrasound', 'fracture', 'medical']):
-                    if score > 20: is_medical_image = True
-                    
-                formatted_preds.append({"label": label.title(), "confidence": score})
-                
-            finding = f"Appearance consistent with {top_label.title()}"
-            if top_label in ["random noise", "random object"] or top_score < 40:
-                 finding = "Image classification uncertain. May not be a standard medical scan."
-                 is_medical_image = False
-                
-            return {
-                "modality": top_label.title() if is_medical_image else "Unknown",
-                "predictions": formatted_preds,
-                "finding": finding,
-                "note": "AI modality detection (CLIP). For screening only."
-            }
-            
-        except Exception as e:
-            return {"error": f"CLIP Analysis Error: {str(e)}"}
-
-    return {"error": "No Vision Models Available."}
+    try:
+        import base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze this medical image. Describe findings and impression."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=300,
+        )
+        
+        description = response.choices[0].message.content
+        
+        return {
+            "modality": "Medical Imaging (OpenAI Analysis)",
+            "predictions": [{"label": "AI Analysis", "confidence": 100}],
+            "finding": description,
+            "note": "Generated by OpenAI Vision. Valid clinical context required."
+        }
+    except Exception as e:
+        print(f"Vision Analysis Error: {e}")
+        return {"error": f"Vision Analysis Error: {str(e)}"}
 
 REFERENCE_RANGES = {
     # 1. COMPLETE BLOOD COUNT (CBC + DIFFERENTIAL)
@@ -1012,20 +904,25 @@ def synthesize_patient_view(processed_data):
 
 def explain_to_patient(text):
     """
-    Uses LLM to generate a patient-friendly explanation.
+    Uses OpenAI to generate a patient-friendly explanation.
     """
     if not text or not text.strip():
         return "No significant findings to explain."
         
-    model = get_explainer()
-    if not model:
+    client = get_openai_client()
+    if not client:
         return simplify_text(text)
         
     try:
-        # Prompt Engineering for Flan-T5
-        prompt = f"Explain this medical finding to a patient in simple words: {text}"
-        output = model(prompt, max_length=128, do_sample=False)
-        return output[0]['generated_text']
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful medical assistant. Explain medical terms to patients in simple, non-alarming language."},
+                {"role": "user", "content": f"Explain this medical finding to a patient in simple words: {text}"}
+            ],
+            max_tokens=150,
+        )
+        return response.choices[0].message.content
     except Exception as e:
         print(f"Explainer Error: {e}")
         return simplify_text(text)
@@ -1531,63 +1428,25 @@ def chunk_text(text, chunk_size=3000, overlap=200):
 
 def summarize_text(text):
     """
-    Recursively summarizes long text (Map-Reduce style).
-    Optimized for Speed: High-Density Extract for medical reports.
+    Uses OpenAI to summarize medical text.
     """
-    model = get_summarizer()
-    if not model: return "Summary unavailable."
+    client = get_openai_client()
+    if not client: 
+        return text[:500] + "..."
     
-    # 1. Faster Threshold: Only summarize if > 1000 words
-    word_count = len(text.split())
-    if word_count < 300:
-        return text[:500] # Too short to summarize effectively
-        
-    # 2. Extract Key Sections (Faster than processing 19 pages of tables)
-    # We look for Impression/Findings/History which contain the "meat"
-    lines = text.split('\n')
-    key_lines = []
-    capture = False
-    for line in lines:
-        l_low = line.lower()
-        if any(k in l_low for k in ["impression", "findings", "history", "diagnosis", "conclusion"]):
-            capture = True
-        if capture and len(key_lines) < 200: # Limit focus
-            key_lines.append(line)
-        if len(line) > 100 and any(k in l_low for k in ["disclaimer", "performed at"]):
-            capture = False
-            
-    focused_text = "\n".join(key_lines) if key_lines else text[:10000]
-    
-    # 3. Direct Summary if manageable
-    if len(focused_text) < 4000:
-        try:
-            summary = model(focused_text, max_length=120, min_length=40, do_sample=False, truncation=True, batch_size=4)
-            return summary[0]['summary_text']
-        except Exception as e:
-            print(f"Summary Error (Direct): {e}")
-            return focused_text[:300] + "..."
-
-    # 4. Long Document Strategy (Density Sampling)
-    print(f"Long clinical text detected ({len(text)} chars). Using High-Density Extract.")
-    chunks = chunk_text(focused_text, chunk_size=3000, overlap=100)
-    
-    chunk_summaries = []
-    # Speedup: Process with Batching
-    BATCH_SIZE = 4 
-    for i in range(0, len(chunks), BATCH_SIZE):
-        batch = chunks[i : i + BATCH_SIZE]
-        try:
-            results = model(batch, max_length=80, min_length=20, do_sample=False, truncation=True, batch_size=len(batch))
-            for res in results:
-                chunk_summaries.append(res['summary_text'])
-        except: continue
-
-    combined = " ".join(chunk_summaries)
     try:
-         final = model(combined[:3500], max_length=150, min_length=50, do_sample=False, truncation=True)
-         return final[0]['summary_text']
-    except:
-         return combined[:500] + "..."
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Summarize the following medical report section concisely for a clinician."},
+                {"role": "user", "content": text[:8000]} # Limit input context
+            ],
+            max_tokens=250,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Summarization Error: {e}")
+        return text[:500] + "..."
 
 def get_follow_up_tests(labs, risks):
     tests = []

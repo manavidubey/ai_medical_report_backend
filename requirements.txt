@@ -4,10 +4,6 @@ python-dotenv
 fastapi
 uvicorn
 python-multipart
-transformers
-torch
-sentencepiece
-spacy
 pdfplumber
 python-docx
 deepdiff
@@ -15,14 +11,6 @@ scipy
 pandas
 gTTS
 fpdf
-sentence-transformers
-faiss-cpu
 Pillow
-accelerate
-protobuf
-paddlepaddle
-paddleocr
-pymupdf
-opencv-python-headless
 googlemaps
 requests
