@@ -171,6 +171,19 @@ async def generate_referral_endpoint(
         print(f"Referral Generation Error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
+@app.get("/timeline")
+async def get_timeline():
+    """
+    Returns a mock health journey timeline for the frontend visualization.
+    """
+    return [
+        {"date": "2023-01-15", "event": "Annual Wellness Visit", "category": "Checkup", "status": "Completed", "impact": "Positive", "details": "Overall health stable. Recommended routine blood work."},
+        {"date": "2023-05-10", "event": "Lipid Panel", "category": "Labs", "status": "Completed", "impact": "Alert", "details": "Total Cholesterol: 210 mg/dL (High). Started lifestyle modifications."},
+        {"date": "2023-11-22", "event": "Follow-up Lipid Panel", "category": "Labs", "status": "Completed", "impact": "Improving", "details": "Total Cholesterol: 195 mg/dL (Normal). Lifestyle changes effective."},
+        {"date": "2024-02-01", "event": "MRI Lumbar Spine", "category": "Imaging", "status": "Scheduled", "impact": "Neutral", "details": "Evaluating persistent lower back pain reported during wellness visit."},
+        {"date": "2024-03-15", "event": "Medication Review", "category": "Clinical", "status": "Future", "impact": "Neutral", "details": "Quarterly review of atorvastatin and lisinopril therapy."}
+    ]
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

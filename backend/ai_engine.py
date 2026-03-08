@@ -203,11 +203,17 @@ REFERENCE_RANGES = {
     "mch": {"min": 27, "max": 33, "unit": "pg"},
     "mchc": {"min": 32, "max": 36, "unit": "g/dL"},
     "rdw": {"min": 11.5, "max": 14.5, "unit": "%"},
+    "mpv": {"min": 7.5, "max": 11.5, "unit": "fL"},
     "neutrophils": {"min": 40, "max": 70, "unit": "%"},
     "lymphocytes": {"min": 20, "max": 40, "unit": "%"},
     "monocytes": {"min": 2, "max": 8, "unit": "%"},
     "eosinophils": {"min": 1, "max": 4, "unit": "%"},
     "basophils": {"min": 0, "max": 1, "unit": "%"},
+    "absolute neutrophils": {"min": 1.5, "max": 8.0, "unit": "10^3/uL"},
+    "absolute lymphocytes": {"min": 1.0, "max": 4.8, "unit": "10^3/uL"},
+    "absolute monocytes": {"min": 0.2, "max": 1.2, "unit": "10^3/uL"},
+    "absolute eosinophils": {"min": 0.0, "max": 0.5, "unit": "10^3/uL"},
+    "absolute basophils": {"min": 0.0, "max": 0.2, "unit": "10^3/uL"},
 
     # 2. LIPID PROFILE (ADVANCED)
     "cholesterol": {"min": 0, "max": 200, "unit": "mg/dL"},
@@ -407,19 +413,43 @@ SYNONYMS = {
     "monocytes": "monocytes",
     "eosinophils": "eosinophils",
     "basophils": "basophils",
+    "anc": "absolute neutrophils",
+    "absolute neutrophil count": "absolute neutrophils",
+    "alc": "absolute lymphocytes",
+    "absolute lymphocyte count": "absolute lymphocytes",
+    "amc": "absolute monocytes",
+    "absolute monocyte count": "absolute monocytes",
+    "aec": "absolute eosinophils",
+    "absolute eosinophil count": "absolute eosinophils",
+    "abc": "absolute basophils",
+    "absolute basophil count": "absolute basophils",
     "r.b.c": "rbc count",
     "rbc": "rbc count",
     "w.b.c": "wbc count",
     "wbc": "wbc count",
-    "tec": "eosinophils",
-    "absolute eosinophil count": "eosinophils", # Approximation
+    "mpv": "mpv",
+    "mean platelet volume": "mpv",
     "iron serum": "iron",
     "unsaturated iron binding capacity": "uibc",
     "total iron binding capacity": "tibc"
 }
 
 def normalize_name(name):
-    clean = name.lower().strip().replace(":", "").replace(".", "")
+    # Standardize: lowercase, remove special chars, handle 'absolute' prefix
+    clean = name.lower().strip().replace(":", "").replace(".", "").replace(",", "")
+    
+    # Handle 'abs' abbreviation for 'absolute'
+    if clean.startswith("abs "):
+        clean = clean.replace("abs ", "absolute ", 1)
+        
+    # Heuristic: If it starts with 'absolute ', check synonyms for the base or full
+    if clean.startswith("absolute "):
+        # Check full first
+        if clean in SYNONYMS: return SYNONYMS[clean]
+        # Then check without 'absolute'
+        base = clean.replace("absolute ", "").strip()
+        if f"absolute {base}" in SYNONYMS: return SYNONYMS[f"absolute {base}"]
+        
     return SYNONYMS.get(clean, clean)
 
 def extract_sections(text):
@@ -673,7 +703,7 @@ def process_clinical_document(text, previous_text=None, user_location=None):
     processed_data["lab_abnormalities"] = [l for l in all_labs if l['status'] != "Normal"]
     
     # Risky Business
-    risks = calculate_risk(all_labs)
+    risks = calculate_risk(all_labs, processed_data["medications"])
     processed_data["risks"] = risks # Matches App.jsx
     processed_data["recommendations"] = generate_recommendations(all_labs, risks)
     print("DEBUG: Getting Specialists...")
@@ -1086,19 +1116,31 @@ def is_significant_test(name, val_str=None):
         "technique", "prepared for", "basic info", "summary", "electronically",
         "click here", "verified", "interpreted", "disclaimer", "pregnant",
         "age", "gender", "sex", "name", "doctor", "history", "findings", "impression",
-        "high risk", "low risk", "desirable", "normal", "abnormal"
+        "high risk", "low risk", "desirable", "normal", "abnormal", "advice",
+        "tata", "address", "collection", "association", "laboratory", "above desirable",
+        "moderate", "very high", "extreme", "category", "possible", "comment", "normally",
+        "insufficiency", "sufficiency", "toxicity", "screening", "profile", "marker"
     ]
     
     # 1. Exact matches or starters
     if any(name_low == n or name_low.startswith(f"{n} ") or name_low.startswith(f"{n}:") for n in noise_words):
         return False
         
-    # 2. Pattern based (e.g. MGP791564 or 15338405)
+    # 2. Unit names as test names (e.g. "dL", "mg/L")
+    if name_low in ["dl", "mg/dl", "g/dl", "u/l", "mmol/l", "%", "ratio", "ml", "fl", "pg"]:
+        return False
+        
+    # 3. Fragments like "2 nd", "1 st"
+    if re.match(r"^\d+\s*(?:st|nd|rd|th)$", name_low):
+        return False
+
+    # 4. Pattern based (e.g. MGP791564 or 15338405)
     if re.match(r"[a-zA-Z]{2,}\d{4,}", name_low) or re.match(r"^\d{5,}", name_low): # Mixed or long numeric ID
         return False
         
-    # 3. Validation
+    # 5. Validation
     if len(name_low) < 2: return False
+    if not any(c.isalpha() for c in name_low): return False # Must have letters
     if not name_low[0].isalnum(): return False
     
     return True
@@ -1110,6 +1152,7 @@ def extract_labs_regex(text):
     Supports Unit Inference if unit is missing.
     """
     labs = []
+    matched_ranges = [] # list of (start, end)
     
     # Pattern: Name: Value Unit? [Range?]
     # Groups: 1=Name, 2=Value, 3=Unit(Optional), 4=Range(Optional)
@@ -1125,7 +1168,8 @@ def extract_labs_regex(text):
         re.compile(r"([A-Za-z0-9 \t\(\)\-\.]{2,60}?):\s*(" + V_VAL + r")\s*([a-zA-Z%\^/0-9\*]*)\s*(?:" + RANGE_REGEX + ")?"),
         
         # 2. Tabular: Name (2+ spaces) Value (Flexible separator for institutional results)
-        re.compile(r"(?m)^\s*([A-Za-z][A-Za-z0-9 \(\)\-\.]{2,40}?)(?:\t|\s{2,})([<>≈]?\s*\d+(?:\.\d+)?(?:\s*million|billion|k|mili)?[\s\d\.\-–\%\^x\*]*)\s*([a-zA-Z%\^/0-9\*]*)\s*(?:" + RANGE_REGEX + ")?"),
+        # Prevents name from capturing trailing numbers if followed by a tab/2+ spaces and more digits
+        re.compile(r"(?m)^\s*([A-Za-z][A-Za-z0-9 \(\)\-\.]{1,40}?[A-Za-z\)\.])(?:\t|\s{2,})([<>≈]?\s*\d+(?:\.\d+)?(?:\s*million|billion|k|mili)?(?:\s*[\^x\*]\s*\d+|[eE][\+\-]?\d+)?)\s*([a-zA-Z%\^/0-9\*]*)\s*(?:" + RANGE_REGEX + ")?"),
         
         # 3. Anchor Hunt: Look for known tests even with single space (Institutional Fallback)
         # Matches: "Hemoglobin 14.5 g/dL" or "RBC 4.8 million"
@@ -1144,6 +1188,13 @@ def extract_labs_regex(text):
             chunk = text[start_idx : start_idx + chunk_size + 500]
             
             for match in pattern.finditer(chunk):
+                m_start = start_idx + match.start()
+                m_end = start_idx + match.end()
+                
+                # Duplicate Check
+                if any(max(0, min(m_end, e) - max(m_start, s)) > (m_end-m_start)*0.7 for s,e in matched_ranges):
+                    continue
+
                 raw_name = ""
                 value = 0.0
                 unit = ""
@@ -1252,7 +1303,8 @@ def extract_labs_regex(text):
                     sys_mult = 1.0
                     if 'million' in sys_unit: sys_mult = 1000000.0
                     elif 'billion' in sys_unit: sys_mult = 1000000000.0
-                    elif sys_unit.startswith('k/'): sys_mult = 1000.0
+                    elif any(k in sys_unit for k in ['k/', '10^3', '10*3']): sys_mult = 1000.0
+                    elif '10^4' in sys_unit: sys_mult = 10000.0
                     
                     lab_min = system_ref['min'] * sys_mult
                     lab_max = system_ref['max'] * sys_mult
@@ -1276,6 +1328,7 @@ def extract_labs_regex(text):
                     "source": ref_source
                 })
                 found_names.add(normalized)
+                matched_ranges.append((m_start, m_end))
                 
     # --- 4. ANCHOR HUNT (Institutional Fallback) ---
     # Many reports (1mg/LabCorp) use single spaces in tabular data.
@@ -1294,6 +1347,11 @@ def extract_labs_regex(text):
         match = re.search(m_pat, text, re.IGNORECASE)
         
         if match:
+            m_start, m_end = match.start(), match.end()
+            # Duplicate Check
+            if any(max(0, min(m_end, e) - max(m_start, s)) > (m_end-m_start)*0.5 for s,e in matched_ranges):
+                continue
+                
             raw_name = marker
             val_str = match.group(1).strip()
             unit = match.group(2).strip()
@@ -1357,8 +1415,36 @@ def extract_labs_regex(text):
         
     return labs
 
-def calculate_risk(labs):
+def check_med_interactions(meds):
+    """
+    Mock medication interaction check for common clinical pairs.
+    """
+    alerts = []
+    med_list = [m.lower() for m in meds]
+    
+    interactions = [
+        (["metformin", "contrast"], "Severe interaction: Metformin must be held for 48 hours after IV contrast to prevent kidney stress."),
+        (["warfarin", "aspirin"], "Increased bleeding risk: Use with caution. Monitor PT/INR."),
+        (["atorvastatin", "amlodipine"], "Potential dose monitoring required: Amlodipine can increase atorvastatin levels."),
+        (["lisinopril", "spironolactone"], "Hyperkalemia risk: Monitor potassium levels closely.")
+    ]
+    
+    for drugs, note in interactions:
+        if all(any(d in m for m in med_list) for d in drugs):
+            alerts.append({
+                "type": "Medication Interaction",
+                "status": "Warning",
+                "level": "Severe" if "Severe" in note else "Moderate",
+                "condition": "Drug-Drug Interaction",
+                "detail": note
+            })
+    return alerts
+
+def calculate_risk(labs, meds=[]):
     risks = []
+    # Add med interactions
+    risks.extend(check_med_interactions(meds))
+    
     lab_map = {l['normalized_name']: l for l in labs}
     
     # 1. Cardiovascular Risk
